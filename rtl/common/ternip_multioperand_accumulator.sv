@@ -44,10 +44,12 @@ module ternip_multioperand_accumulator #(
     parameter ternip_pkg::ternip_cfg_t Cfg = `TERNIP_CFG,
 
     parameter type operand_t = logic signed [8:0],
-    parameter type result_t = ternip_types#(Cfg)::fixed_point_t,
+    // Plain default: Verilator rejects ternip_types#(Cfg)::fixed_point_t here.
+    parameter type result_t = logic signed [7:0],
     parameter int NUM_OPERANDS = 16,
     parameter int NEXT_STAGE_FANIN = 4,
-    parameter int D = Cfg.D
+    // 0 → Cfg.D (Verilator rejects `parameter int D = Cfg.D`)
+    parameter int D = 0
 ) (
     input  logic                        clk_i,
     input  logic                        rst_ni,
@@ -62,6 +64,8 @@ module ternip_multioperand_accumulator #(
     output result_t                     out_result_o
 );
 
+localparam int EffectiveD = (D > 0) ? D : Cfg.D;
+
 `ifndef SYNTHESIS
 if (!$onehot(NEXT_STAGE_FANIN))
     $fatal(0, "NEXT_STAGE_FANIN must be a power of 2");
@@ -70,7 +74,7 @@ if (!$onehot(NEXT_STAGE_FANIN))
 localparam int NumStages = (NUM_OPERANDS > 1) ? int'($ceil($ln(1.0*NUM_OPERANDS) / $ln(1.0*NEXT_STAGE_FANIN))) : 1;
 localparam int OperandCapacity = NEXT_STAGE_FANIN**(NumStages-1);
 localparam int PipelineDataWidth = ((NEXT_STAGE_FANIN-1) * NumStages) + $bits(operand_t);
-localparam int AccumulatorWidth = PipelineDataWidth + $clog2(D);
+localparam int AccumulatorWidth = PipelineDataWidth + $clog2(EffectiveD);
 
 typedef logic signed [PipelineDataWidth-1:0] pipeline_data_t;
 typedef logic signed [AccumulatorWidth-1:0] accumulator_t;

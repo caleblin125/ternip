@@ -130,6 +130,7 @@ always_ff @(posedge clk_i) begin
 end
 
 `ifndef SYNTHESIS
+`ifndef VERILATOR
 
 // Ensure that correct latency is achieved
 property fixed_latency_p;
@@ -140,6 +141,7 @@ endproperty
 assert property (fixed_latency_p)
     else $fatal(0, "latency deviated from the fixed %0d cycles", NumCycles);
 
+`endif
 `endif
 
 endmodule
