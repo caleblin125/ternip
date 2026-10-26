@@ -251,23 +251,19 @@ always_comb begin
             end
 
         end else if (operation_is_multioperand && !operation_is_multicycle) begin
-            // ADD / SUB
-            vector_read_ready_o = 1;
-            if (vector_read_valid_i) begin
-                read_response_counter_d++;
-                if (read_response_counter_q % 2 == 0) begin // received vec1 read
-                    vector1_r_data_d = vector_read_data_i;
-                end
-            end
+            // ADD / SUB: the vec2 response is added into multicycle_result_buffer
+            // and written from there the next cycle, so the read data does not
+            // reach the vector-register write port combinationally.
 
-            // Request issuance: write takes priority over read on the cycle
-            // an odd response arrives; otherwise issue the next read.
-            if (vector_read_valid_i && (read_response_counter_q % 2 == 1)) begin // received vec2 read -> write
+            // buffer -> write request (priority over reads)
+            if (multicycle_result_buffer_valid_q) begin
                 vector_request_valid_o = 1;
                 vector_request_write_not_read_o = 1;
                 vector_request_vector_select_o = vector3_select_q;
                 vector_request_vector_addr_o = write_request_counter_q;
                 if (vector_request_ready_i) begin
+                    multicycle_result_buffer_d = 'x;
+                    multicycle_result_buffer_valid_d = 0;
                     write_request_counter_d++;
                     if (write_request_counter_q >= ternip_types#(Cfg)::NumChunksPerVector-1) begin
                         state_d = WAITING_FOR_IN;
@@ -283,6 +279,19 @@ always_comb begin
                 vector_request_vector_addr_o = read_request_counter_q / 2;
                 if (vector_request_ready_i) begin
                     read_request_counter_d++;
+                end
+            end
+
+            // responses: vec1 -> vector1_r_data; vec2 -> result buffer once it is free
+            vector_read_ready_o = (read_response_counter_q % 2 == 0) || !multicycle_result_buffer_valid_q;
+            if (vector_read_ready_o && vector_read_valid_i) begin
+                read_response_counter_d++;
+                if (read_response_counter_q % 2 == 0) begin // received vec1 read
+                    vector1_r_data_d = vector_read_data_i;
+                end else begin                              // received vec2 read
+                    multicycle_result_buffer_d = (vector_operation_q == ternip_pkg::ADD)
+                                               ? rowwise_add_result : rowwise_sub_result;
+                    multicycle_result_buffer_valid_d = 1;
                 end
             end
         end else if (operation_is_multioperand && operation_is_multicycle) begin
@@ -520,8 +529,8 @@ ternip_silu_parallelized #(
 
 always_comb begin
     unique case (vector_operation_q)
-        ternip_pkg::ADD:     vector_request_w_data_o = rowwise_add_result;
-        ternip_pkg::SUB:     vector_request_w_data_o = rowwise_sub_result;
+        ternip_pkg::ADD:     vector_request_w_data_o = multicycle_result_buffer_q;
+        ternip_pkg::SUB:     vector_request_w_data_o = multicycle_result_buffer_q;
         ternip_pkg::MUL:     vector_request_w_data_o = multicycle_result_buffer_q;
         ternip_pkg::DIV:     vector_request_w_data_o = multicycle_result_buffer_q;
         ternip_pkg::SIG:     vector_request_w_data_o = multicycle_result_buffer_q;
