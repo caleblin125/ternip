@@ -283,7 +283,7 @@ function automatic int unsigned msb_len(input logic [LenWidth-1:0] x);
     for (int i = 0; i < LenWidth; i++) if (x[i]) msb_len = i;
 endfunction
 
-enum logic [2:0] {IDLE, NORMALISE, SEED, ISSUE, WAIT, DONE} state_q;
+enum logic [2:0] {IDLE, NORMALISE, SEED, ISSUE, WAIT, SHIFT, SATURATE, DONE} state_q;
 
 logic [AccWidth-1:0] acc_q;
 logic [LenWidth-1:0] len_q;
@@ -294,6 +294,8 @@ recip_t              r_acc_q, r_len_q;
 logic [31:0]         t_q;
 logic [3:0]          step_q;       // 0..13, see below
 logic signed [OutPrecision-1:0] y_q;
+logic signed [15:0]  sh_q;         // k_len - k_acc + Shift0 - F, set in SEED
+logic [63:0]         y_wide_q;
 
 // One pipelined unsigned 32x32 multiplier.
 (* use_dsp = "yes" *) logic [63:0] mul_p [MulLatency];
@@ -334,7 +336,7 @@ wire logic [63:0] product = mul_p[MulLatency-1];
 // final shift: y = p2 * 2^(k_len - k_acc + Shift0 - F), rounded to nearest, saturated
 logic [63:0] y_wide;
 always_comb begin
-    automatic int sh = int'(k_len_q) - int'(k_acc_q) + Shift0 - F;
+    automatic int sh = int'(sh_q);
     y_wide = '0;
     if (sh >= 0) begin
         y_wide = (sh >= 32) ? 64'hFFFF_FFFF_FFFF_FFFF : (64'(t_q) << sh);
@@ -376,6 +378,7 @@ always_ff @(posedge clk_i) begin
         SEED: begin
             r_acc_q <= seed(m_acc_q[31:24]);
             r_len_q <= seed(m_len_q[31:24]);
+            sh_q <= 16'(int'(k_len_q) - int'(k_acc_q) + Shift0 - F);
             step_q <= '0;
             state_q <= ISSUE;
         end
@@ -393,11 +396,20 @@ always_ff @(posedge clk_i) begin
                 r_acc_q <= recip_t'(product >> (F + 1));
             end
             if (step_q == 13) begin
-                state_q <= DONE;
+                state_q <= SHIFT;
             end else begin
                 step_q <= step_q + 1;
                 state_q <= ISSUE;
             end
+        end
+        SHIFT: begin                // t_q holds p2: shift / round into y_wide_q
+            y_wide_q <= y_wide;
+            state_q <= SATURATE;
+        end
+        SATURATE: begin
+            y_q <= len_zero_q ? '0
+                 : (y_wide_q > OutMax) ? OutPrecision'(OutMax) : OutPrecision'(y_wide_q);
+            state_q <= DONE;
         end
         DONE: begin
             if (out_ready_i) state_q <= IDLE;
@@ -407,10 +419,8 @@ always_ff @(posedge clk_i) begin
     end
 end
 
-// t_q holds p2 once step 13 completes
 assign in_ready_o  = (state_q == IDLE);
 assign out_valid_o = (state_q == DONE);
-assign y_o = len_zero_q ? '0
-           : (y_wide > OutMax) ? OutPrecision'(OutMax) : OutPrecision'(y_wide);
+assign y_o = y_q;
 
 endmodule

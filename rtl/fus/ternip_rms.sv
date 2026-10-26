@@ -155,8 +155,13 @@ logic [$clog2(Beats+1)-1:0] piso_beat_d, piso_beat_q;
 logic                       piso_take;   // consumer accepts the current RP lanes this cycle
 lanes_t                     piso_lanes;
 
-always_comb begin
-    for (int r = 0; r < RP; r++) piso_lanes[r] = piso_data_q[int'(piso_beat_q) * RP + r];
+// piso_lanes = piso_data_q[piso_beat_q*RP +: RP], held in a register: the beat
+// select runs on the _d side, so the squarers / normalise multipliers see a
+// flop output (the select fed the multiplier's input conversion directly).
+always_ff @(posedge clk_i) begin
+    for (int r = 0; r < RP; r++)
+        if (int'(piso_beat_d) * RP + r < $bits(chunk_t) / $bits(piso_lanes[0]))
+            piso_lanes[r] <= piso_data_d[int'(piso_beat_d) * RP + r];
 end
 
 wire logic piso_last = (int'(piso_beat_q) == Beats - 1);
