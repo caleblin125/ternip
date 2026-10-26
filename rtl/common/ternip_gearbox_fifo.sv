@@ -42,7 +42,12 @@
 module ternip_gearbox_fifo #(
     parameter int InDataWidth = 8,
     parameter int OutDataWidth = 8,
-    parameter bit FastPush = 0
+    parameter bit FastPush = 0,
+    // Widths that do not divide each other: 1 = two chained gearboxes through
+    // gcd(InDataWidth, OutDataWidth) bits (each a cheap PISO / SIPO, gcd bits per
+    // cycle), 0 = the staging-register shifter (full width per cycle, but wide
+    // variable shifts that fail timing at high utilization).
+    parameter bit NonMultipleViaGcd = 0
 ) (
     input  logic                    clk_i,
     input  logic                    rst_ni,
@@ -103,6 +108,44 @@ end else if (gcd(InDataWidth, OutDataWidth) == InDataWidth) begin : sipo
         .yumi_i(out_ready_i && out_valid_o),
         .v_o(out_valid_o),
         .data_o(out_data_o)
+    );
+
+end else if (NonMultipleViaGcd) begin : non_multiple_via_gcd
+
+    localparam int MidWidth = gcd(InDataWidth, OutDataWidth);
+
+    logic                mid_ready;
+    logic                mid_valid;
+    logic [MidWidth-1:0] mid_data;
+
+    ternip_gearbox_fifo #(
+        .InDataWidth(InDataWidth),
+        .OutDataWidth(MidWidth),
+        .FastPush(FastPush)
+    ) to_mid (
+        .clk_i,
+        .rst_ni,
+        .in_ready_o,
+        .in_valid_i,
+        .in_data_i,
+        .out_ready_i(mid_ready),
+        .out_valid_o(mid_valid),
+        .out_data_o(mid_data)
+    );
+
+    ternip_gearbox_fifo #(
+        .InDataWidth(MidWidth),
+        .OutDataWidth(OutDataWidth),
+        .FastPush(FastPush)
+    ) from_mid (
+        .clk_i,
+        .rst_ni,
+        .in_ready_o(mid_ready),
+        .in_valid_i(mid_valid),
+        .in_data_i(mid_data),
+        .out_ready_i,
+        .out_valid_o,
+        .out_data_o
     );
 
 end else begin : non_multiple
