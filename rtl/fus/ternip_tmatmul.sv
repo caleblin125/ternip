@@ -377,6 +377,33 @@ ternip_pipelined_mem #(
     .read_data_o(exportvector_read_data)
 );
 
+// IMPORT skid: a two-entry FIFO in front of the import gearbox, so
+// vector_read_ready_o is a register (not full) instead of the gearbox's
+// round-robin fullness logic, which reached the vector-register read buffer's
+// clock enable through the core's ready OR (the 300 MHz critical path).
+logic          import_skid_in_ready;
+logic          import_skid_in_valid;
+logic          import_skid_out_valid;
+vector_chunk_t import_skid_out_data;
+
+bsg_two_fifo #(
+    .width_p($bits(vector_chunk_t))
+) import_skid (
+    .clk_i,
+    .reset_i(!rst_ni),
+
+    .ready_param_o(import_skid_in_ready),
+    .data_i(vector_read_data_i),
+    .v_i(import_skid_in_valid),
+
+    .v_o(import_skid_out_valid),
+    .data_o(import_skid_out_data),
+    .yumi_i(import_skid_out_valid && gbfifo_import_in_ready)
+);
+
+assign gbfifo_import_in_valid = import_skid_out_valid;
+assign gbfifo_import_in_data = import_skid_out_data;
+
 // IMPORT gearbox_fifo: vector_chunk_t -> fixed_point_t [TmatmulParallelism-1:0]
 ternip_gearbox_fifo #(
     .InDataWidth($bits(gbfifo_import_in_data)),
@@ -458,8 +485,7 @@ always_comb begin
     exportvector_request_w_data = 'x;
     exportvector_read_ready = 0;
 
-    gbfifo_import_in_valid = 0;
-    gbfifo_import_in_data = 'x;
+    import_skid_in_valid = 0;
     gbfifo_import_out_ready = 0;
 
     gbfifo_export_in_valid = 0;
@@ -517,9 +543,8 @@ always_comb begin
         end
 
         // Feed vector chunks into adapter
-        vector_read_ready_o = gbfifo_import_in_ready;
-        gbfifo_import_in_valid = vector_read_valid_i;
-        gbfifo_import_in_data = vector_read_data_i;
+        vector_read_ready_o = import_skid_in_ready;
+        import_skid_in_valid = vector_read_valid_i;
 
         // Receive deserialized elements from adapter and write to BRAMs
         gbfifo_import_out_ready = importvector_request_ready;
