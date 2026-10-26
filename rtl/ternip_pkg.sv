@@ -114,6 +114,59 @@ typedef enum logic [1:0] {
     DIV_NONE
 } div_impl_e;
 
+// Ternary weight storage format of the tmatmul DDR stream.
+//  TERNARY_2BIT:    4 trits per byte, ternary_t encoding (01=+1, 11=-1, 00=0).
+//  TERNARY_PACKED5: 5 trits per byte, base 3: byte = d0 + 3*d1 + 9*d2 + 27*d3 + 81*d4,
+//                   digit 0=-1, 1=0, 2=+1. Each beat of TmatmulParallelism trits is
+//                   padded to ceil(TmatmulParallelism/5) bytes with digit 1.
+typedef enum logic [0:0] {
+    TERNARY_2BIT,
+    TERNARY_PACKED5
+} ternary_encoding_e;
+
+// Base-3 unpacking for TERNARY_PACKED5.
+typedef enum logic [1:0] {
+    TRIT5_DECODE_ARITH,
+    TRIT5_DECODE_LUT,
+    TRIT5_DECODE_RESIDUE,
+    TRIT5_DECODE_DIRECT
+} trit5_decoder_e;
+
+// Ternary dot-product arithmetic.
+typedef enum logic [2:0] {
+    TDOT_TWOS_ADDER_TREE,
+    TDOT_ONES_ADDER_TREE,
+    TDOT_ONES_CSA,
+    TDOT_ONES_DSP_TREE,  // ones'-complement operands, pairwise adds mapped to DSP48 SIMD, popcount correction
+    TDOT_ONES_GPC        // ones'-complement operands, K:clog2(K+1) column-counter tree (TmatmulGpcK, TmatmulGpcFinalRows)
+} tdot_arith_e;
+
+// Where the ones'-complement correction (+1 per negative weight) is added.
+typedef enum logic [1:0] {
+    TDOT_CORR_AFTER,
+    TDOT_CORR_INJECT_COUNT,
+    TDOT_CORR_INJECT_BITS
+} tdot_correction_e;
+
+// How ternary weight beats are delivered to BatchSize cores (parent ternip_batched).
+//  WEIGHT_DIST_COMB: combinational fanout of the shared DDR stream (baseline).
+//  WEIGHT_DIST_PIPE: per-core ready/valid pipeline (local registered copies).
+//  WEIGHT_DIST_BRAM: per-core BRAM FIFO holding a full matrix copy.
+//  WEIGHT_DIST_TREE: broadcast tree, per-level fanouts WeightTreeShape (default binary).
+//  WEIGHT_DIST_RING / RING2 / RING2M / LONG: HPL panel-broadcast topologies
+//                    (increasing ring, increasing 2-ring, modified 2-ring, and
+//                    bandwidth-reducing scatter + bidirectional roll).
+typedef enum logic [2:0] {
+    WEIGHT_DIST_COMB,
+    WEIGHT_DIST_PIPE,
+    WEIGHT_DIST_BRAM,
+    WEIGHT_DIST_TREE,
+    WEIGHT_DIST_RING,
+    WEIGHT_DIST_RING2,
+    WEIGHT_DIST_RING2M,
+    WEIGHT_DIST_LONG
+} weight_dist_e;
+
 // ================= //
 // Ternip parameters //
 // ================= //
@@ -188,6 +241,69 @@ typedef enum logic [2:0] {
 // ==================================================== //
 typedef logic signed [1:0] ternary_t;
 
+localparam int TritsPerPackedByte = 5;
+
+function automatic integer tmatmul_stream_width(ternary_encoding_e encoding, integer parallelism);
+    if (encoding == TERNARY_PACKED5)
+        return 8 * ((parallelism + TritsPerPackedByte - 1) / TritsPerPackedByte);
+    return parallelism * $bits(ternary_t);
+endfunction
+
+// Datapath / weight-distribution knobs (parent passes -D macros; defaults =
+// original baseline). Structural config comes from `TERNIP_CFG (JSON → -D).
+`ifndef TERNIP_TMATMUL_ENCODING
+`define TERNIP_TMATMUL_ENCODING TERNARY_2BIT
+`endif
+`ifndef TERNIP_TMATMUL_DECODER
+`define TERNIP_TMATMUL_DECODER TRIT5_DECODE_LUT
+`endif
+`ifndef TERNIP_TMATMUL_ARITH
+`define TERNIP_TMATMUL_ARITH TDOT_TWOS_ADDER_TREE
+`endif
+`ifndef TERNIP_TMATMUL_CORRECTION
+`define TERNIP_TMATMUL_CORRECTION TDOT_CORR_AFTER
+`endif
+localparam ternary_encoding_e TmatmulEncoding = `TERNIP_TMATMUL_ENCODING;
+localparam trit5_decoder_e    TmatmulDecoder  = `TERNIP_TMATMUL_DECODER;
+localparam tdot_arith_e       TmatmulArith    = `TERNIP_TMATMUL_ARITH;
+localparam tdot_correction_e  TmatmulCorrection = `TERNIP_TMATMUL_CORRECTION;
+// TDOT_ONES_GPC: rows per column counter (3 = the 3:2 CSA) and rows left for the final adder (2 or 3)
+`ifndef TERNIP_TMATMUL_GPC_K
+`define TERNIP_TMATMUL_GPC_K 6
+`endif
+`ifndef TERNIP_TMATMUL_GPC_FINAL_ROWS
+`define TERNIP_TMATMUL_GPC_FINAL_ROWS 2
+`endif
+// 1: each group of K rows is one carry-propagate add (K = 3: ternary-adder tree)
+`ifndef TERNIP_TMATMUL_GPC_ADD
+`define TERNIP_TMATMUL_GPC_ADD 0
+`endif
+localparam int                TmatmulGpcK         = `TERNIP_TMATMUL_GPC_K;
+localparam int                TmatmulGpcFinalRows = `TERNIP_TMATMUL_GPC_FINAL_ROWS;
+localparam bit                TmatmulGpcAdd       = `TERNIP_TMATMUL_GPC_ADD;
+
+`ifndef TERNIP_WEIGHT_DIST
+`define TERNIP_WEIGHT_DIST WEIGHT_DIST_COMB
+`endif
+`ifndef TERNIP_WEIGHT_PIPE_STAGES
+`define TERNIP_WEIGHT_PIPE_STAGES 2
+`endif
+localparam weight_dist_e WeightDistribution = `TERNIP_WEIGHT_DIST;
+
+// Elements per cycle in ternip_rms (squarers / normalise multipliers); 0 = VectorParallelism.
+// Must divide VectorParallelism. Narrower RMS overlaps with tmatmul streaming (see ternip_rms).
+`ifndef TERNIP_RMS_PARALLELISM
+`define TERNIP_RMS_PARALLELISM 0
+`endif
+localparam int RmsParallelism = `TERNIP_RMS_PARALLELISM;
+localparam int WeightPipeStages = `TERNIP_WEIGHT_PIPE_STAGES;
+// WEIGHT_DIST_TREE shape: per-level fanouts from the root, one hex digit each (1..15, up to 7
+// levels), root in the low digit ('h42 = root fans to 2, each of those to 4; pass it to -D as the
+// decimal, 66). 0 = binary, clog2(BatchSize) levels.
+`ifndef TERNIP_WEIGHT_TREE_SHAPE
+`define TERNIP_WEIGHT_TREE_SHAPE 0
+`endif
+localparam longint unsigned WeightTreeShape = `TERNIP_WEIGHT_TREE_SHAPE;
 
 endpackage : ternip_pkg
 

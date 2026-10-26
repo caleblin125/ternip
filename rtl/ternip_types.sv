@@ -40,8 +40,11 @@ class ternip_types #(
 
     localparam int VectorSizeInBytes     = Cfg.D * Cfg.FixedPointPrecision / 8;
     localparam int BytesPerFixedPointNum = Cfg.FixedPointPrecision / 8;
-    localparam int MatrixSizeInBytes     = Cfg.D * Cfg.D * 2 / 8;
     localparam int TernaryWeightsPerByte = 8 / 2;
+    localparam int TmatmulStreamWidth    = ternip_pkg::tmatmul_stream_width(
+                                               ternip_pkg::TmatmulEncoding, Cfg.TmatmulParallelism);
+    localparam int MatrixSizeInBytes     = ((Cfg.D * Cfg.D) / Cfg.TmatmulParallelism)
+                                           * (TmatmulStreamWidth / 8);
 
     localparam int RmsSqaSumPrecision          = 2 * Cfg.FixedPointPrecision;
     localparam int RmsSqaSumExponent           = 2 * Cfg.FixedPointExponent;
@@ -84,7 +87,7 @@ class ternip_types #(
     typedef logic [$clog2(Cfg.NumVectorRegisters)-1:0] vector_select_t;
     typedef logic [Cfg.DdrAddressWidth-1:0] ddr_address_t;
     typedef logic [Cfg.ImmediateWidth-1:0] immediate_t;
-    typedef ternip_pkg::ternary_t [Cfg.TmatmulParallelism-1:0] tmatmul_stream_data_t;
+    typedef logic [TmatmulStreamWidth-1:0] tmatmul_stream_data_t;
 
 
     // Packed instruction layout (config-independent enums come from ternip_pkg)
