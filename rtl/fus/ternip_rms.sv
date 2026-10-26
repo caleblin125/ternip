@@ -37,6 +37,14 @@
 // one FINISH_ACCUMULATE command, and one or more NORM commands. The unit accepts
 // one command on in_* and sequences the vector-register and math handshakes
 // until that command finishes.
+//
+// Datapath width: vector chunks are VectorParallelism (VP) elements, but the squarers
+// and normalise multipliers are RmsParallelism (RP, ternip_pkg; 0 = VP) wide, so each
+// chunk takes VP/RP cycles. The scheduler overlaps RMS with tmatmul streaming, which
+// hides most of that (model: VP4 -> RP2 costs ~1% tok/s). Read responses land in a
+// small chunk FIFO and a read is only requested when its response has room, so a
+// narrow RMS never stalls the shared vector-register pipeline. The scale factor is
+// sqrt(rms_length / accumulator) from ternip_rsqrt (no divider).
 
 module ternip_rms #(
     parameter ternip_pkg::ternip_cfg_t Cfg = `TERNIP_CFG
@@ -70,6 +78,32 @@ module ternip_rms #(
     output logic                                      rms_value_reciprocal_valid_o
 );
 
+// Same values as ternip_types#(Cfg) (local copies: Verilator rejects dotted class
+// parameters in parameter positions, which kept RMS out of simulation).
+localparam int RmsSqaSumPrecision          = 2 * Cfg.FixedPointPrecision;
+localparam int RmsSqaSumExponent           = 2 * Cfg.FixedPointExponent;
+localparam int RmsValueReciprocalPrecision = 2 * (Cfg.FixedPointPrecision + 1);
+localparam int RmsValueReciprocalExponent  = -int'(Cfg.FixedPointPrecision);
+localparam int RmsAccumulatorWidth         = 2 * Cfg.FixedPointPrecision + $clog2(Cfg.D) + 1;
+localparam int NumChunksPerVector          = Cfg.D / Cfg.VectorParallelism;
+
+localparam int VP = Cfg.VectorParallelism;
+localparam int RP = (ternip_pkg::RmsParallelism <= 0 || ternip_pkg::RmsParallelism > VP)
+                    ? VP : ternip_pkg::RmsParallelism;
+localparam int Beats = VP / RP;            // cycles per chunk
+localparam int ChunkFifoDepth = 8;         // read credits
+
+`ifndef SYNTHESIS
+initial assert ((VP % RP) == 0) else $fatal(1, "RmsParallelism (%0d) must divide VectorParallelism (%0d)", RP, VP);
+`endif
+
+typedef logic signed [Cfg.FixedPointPrecision-1:0]  fixed_point_t;
+typedef fixed_point_t [VP-1:0]                      chunk_t;
+typedef fixed_point_t [RP-1:0]                      lanes_t;
+typedef logic signed [RmsSqaSumPrecision-1:0]       sqa_t;
+typedef logic signed [RmsAccumulatorWidth-1:0]      accumulator_t;
+typedef logic signed [RmsValueReciprocalPrecision-1:0] reciprocal_t;
+
 ternip_pkg::rms_op_e                rms_op_d, rms_op_q;
 ternip_types#(Cfg)::vector_select_t in_vector1_select_d, in_vector1_select_q;
 ternip_types#(Cfg)::vector_select_t in_vector2_select_d, in_vector2_select_q;
@@ -80,72 +114,85 @@ enum logic [2:0] {
     WORKING,
     SENDING_FINAL_TO_ACCUMULATOR,
     WAITING_FOR_ACCUMULATOR,
-    SENDING_TO_DIVIDER
+    SENDING_TO_RSQRT
 } state_d, state_q = WAITING_FOR_IN;
 
-logic [$clog2(ternip_types#(Cfg)::NumChunksPerVector):0] vector_read_counter_d, vector_read_counter_q;
-logic [$clog2(ternip_types#(Cfg)::NumChunksPerVector):0] vector_processed_counter_d, vector_processed_counter_q;
+logic [$clog2(NumChunksPerVector):0]         read_counter_d, read_counter_q;       // chunks requested
+logic [$clog2(NumChunksPerVector):0]         write_counter_d, write_counter_q;     // chunks written (NORM)
+logic [$clog2(NumChunksPerVector * Beats):0] beat_counter_d, beat_counter_q;       // beats accumulated
+logic [$clog2(ChunkFifoDepth):0]             outstanding_d, outstanding_q;         // requested, not yet in the PISO
 
 
-// Accumulate
+// Read responses -> chunk FIFO -> parallel-to-serial (RP lanes per cycle)
 
-logic [Cfg.VectorParallelism-1:0]  square_in_ready;
-logic [Cfg.VectorParallelism-1:0]  square_in_valid;
-ternip_types#(Cfg)::vector_chunk_t square_operand_in;
+logic   fifo_in_ready, fifo_out_valid, fifo_out_yumi;
+chunk_t fifo_out_data;
 
-logic [Cfg.VectorParallelism-1:0]                             square_out_ready;
-logic [Cfg.VectorParallelism-1:0]                             square_out_valid;
-ternip_types#(Cfg)::rms_sqa_sum_t [Cfg.VectorParallelism-1:0] square_result_out;
+bsg_fifo_1r1w_small #(
+    .width_p($bits(chunk_t)),
+    .els_p(ChunkFifoDepth),
+    .harden_p(0),
+    .ready_THEN_valid_p(0)
+) chunk_fifo (
+    .clk_i,
+    .reset_i(!rst_ni),
+    .v_i(vector_read_valid_i && vector_read_ready_o),
+    .ready_param_o(fifo_in_ready),
+    .data_i(vector_read_data_i),
+    .v_o(fifo_out_valid),
+    .data_o(fifo_out_data),
+    .yumi_i(fifo_out_yumi)
+);
 
 `ifndef SYNTHESIS
-// Verify that all square modules are synchronized
-// If all square modules are synchronized, then only square[0]'s control signals need to be read
-always_comb begin
-    assert (!rst_ni || ((&square_in_ready) == (|square_in_ready)))
-        else $fatal(0, "square_in_ready bits are not all uniform");
-    assert (!rst_ni || ((&square_in_valid) == (|square_in_valid)))
-        else $fatal(0, "square_in_valid bits are not all uniform");
-    assert (!rst_ni || ((&square_out_ready) == (|square_out_ready)))
-        else $fatal(0, "square_out_ready bits are not all uniform");
-    assert (!rst_ni || ((&square_out_valid) == (|square_out_valid)))
-        else $fatal(0, "square_out_valid bits are not all uniform");
-end
+assert property (@(posedge clk_i) disable iff (!rst_ni) (vector_read_valid_i && outstanding_q != 0) |-> fifo_in_ready)
+    else $fatal(1, "ternip_rms: read response with no FIFO room (credit bug)");
 `endif
 
-for (genvar i_GEN = 0; i_GEN < Cfg.VectorParallelism; i_GEN++) begin : parallel_squares
+logic                       piso_valid_d, piso_valid_q;
+chunk_t                     piso_data_d, piso_data_q;
+logic [$clog2(Beats+1)-1:0] piso_beat_d, piso_beat_q;
+logic                       piso_take;   // consumer accepts the current RP lanes this cycle
+lanes_t                     piso_lanes;
 
+always_comb begin
+    for (int r = 0; r < RP; r++) piso_lanes[r] = piso_data_q[int'(piso_beat_q) * RP + r];
+end
+
+wire logic piso_last = (int'(piso_beat_q) == Beats - 1);
+
+
+// Accumulate: RP squarers -> RP-operand accumulator
+
+logic [RP-1:0] square_in_ready, square_in_valid, square_out_ready, square_out_valid;
+sqa_t [RP-1:0] square_result_out;
+
+for (genvar i_GEN = 0; i_GEN < RP; i_GEN++) begin : parallel_squares
     ternip_mul #(
         .InAPrecision(Cfg.FixedPointPrecision),
         .InAExponent(Cfg.FixedPointExponent),
         .InBPrecision(Cfg.FixedPointPrecision),
         .InBExponent(Cfg.FixedPointExponent),
-        .OutPrecision(ternip_types#(Cfg)::RmsSqaSumPrecision),
-        .OutExponent(ternip_types#(Cfg)::RmsSqaSumExponent),
+        .OutPrecision(RmsSqaSumPrecision),
+        .OutExponent(RmsSqaSumExponent),
         .FinalConversionNumPipelineStages(2)
     ) square (
         .clk_i,
         .rst_ni,
-
         .in_ready_o(square_in_ready[i_GEN]),
         .in_valid_i(square_in_valid[i_GEN]),
-        .a_i(square_operand_in[i_GEN]),
-        .b_i(square_operand_in[i_GEN]),
-
+        .a_i(piso_lanes[i_GEN]),
+        .b_i(piso_lanes[i_GEN]),
         .out_ready_i(square_out_ready[i_GEN]),
         .out_valid_o(square_out_valid[i_GEN]),
         .y_o(square_result_out[i_GEN])
     );
-
 end
 
-logic                                                         accumulator_in_ready;
-logic                                                         accumulator_in_valid;
-logic                                                         accumulator_in_final;
-ternip_types#(Cfg)::rms_sqa_sum_t [Cfg.VectorParallelism-1:0] accumulator_in_operand;
-
-logic                                 accumulator_out_ready;
-logic                                 accumulator_out_valid;
-ternip_types#(Cfg)::rms_accumulator_t accumulator_out_result;
+logic         accumulator_in_ready, accumulator_in_valid, accumulator_in_final;
+sqa_t [RP-1:0] accumulator_in_operand;
+logic         accumulator_out_ready, accumulator_out_valid;
+accumulator_t accumulator_out_result;
 
 always_ff @(posedge clk_i) begin
     if (!rst_ni) begin
@@ -164,159 +211,106 @@ always_ff @(posedge clk_i) begin
 end
 
 ternip_multioperand_accumulator #(
-    .operand_t(ternip_types#(Cfg)::rms_sqa_sum_t),
-    .result_t(ternip_types#(Cfg)::rms_accumulator_t),
-    .NUM_OPERANDS(Cfg.VectorParallelism),
-    .NEXT_STAGE_FANIN(2)
+    .operand_t(sqa_t),
+    .result_t(accumulator_t),
+    .NUM_OPERANDS(RP),
+    .NEXT_STAGE_FANIN(2),
+    .D(Cfg.D)
 ) multioperand_accumulator (
     .clk_i,
     .rst_ni,
-
     .in_ready_o(accumulator_in_ready),
     .in_valid_i(accumulator_in_valid),
     .in_final_i(accumulator_in_final),
     .in_operands_i(accumulator_in_operand),
-
     .out_ready_i(accumulator_out_ready),
     .out_valid_o(accumulator_out_valid),
     .out_result_o(accumulator_out_result)
 );
 
 
-// Finish accumulate
+// Finish accumulate: rms_value_reciprocal = sqrt(rms_length / accumulator)
 
-// rms_value_reciprocal = 1 / SQRT( accumulator / rms_length )
-// rms_value_reciprocal = SQRT( rms_length / accumulator )
-
-ternip_types#(Cfg)::rms_value_reciprocal_t rms_value_reciprocal_d, rms_value_reciprocal_q;
-logic                                      rms_value_reciprocal_valid_d, rms_value_reciprocal_valid_q;
+reciprocal_t rms_value_reciprocal_d, rms_value_reciprocal_q;
+logic        rms_value_reciprocal_valid_d, rms_value_reciprocal_valid_q;
 
 assign rms_value_reciprocal_o       = rms_value_reciprocal_q;
 assign rms_value_reciprocal_valid_o = rms_value_reciprocal_valid_q;
 
-logic                                 div_in_ready;
-logic                                 div_in_valid;
-ternip_types#(Cfg)::immediate_t       div_in_dividend;
-ternip_types#(Cfg)::rms_accumulator_t div_in_divisor;
+// Registered operands break the MOA -> rsqrt combinational path.
+accumulator_t                   rsqrt_acc_d, rsqrt_acc_q;
+ternip_types#(Cfg)::immediate_t rsqrt_len_d, rsqrt_len_q;
+logic                           rsqrt_in_ready, rsqrt_in_valid, rsqrt_out_ready, rsqrt_out_valid;
+reciprocal_t                    rsqrt_y;
 
-// Register dividend/divisor to break the MOA -> divider combinational path.
-ternip_types#(Cfg)::immediate_t       div_captured_dividend_d, div_captured_dividend_q;
-ternip_types#(Cfg)::rms_accumulator_t div_captured_divisor_d,  div_captured_divisor_q;
-
-logic                                div_out_ready;
-logic                                div_out_valid;
-ternip_types#(Cfg)::rms_sqrt_input_t div_out_quotient;
-
-ternip_div #(
-    .InAPrecision(Cfg.ImmediateWidth),
-    .InAExponent(0),
-    .InBPrecision(ternip_types#(Cfg)::RmsAccumulatorWidth),
-    .InBExponent(ternip_types#(Cfg)::RmsSqaSumExponent),
-    .OutPrecision(ternip_types#(Cfg)::RmsSqrtInputPrecision),
-    .OutExponent(ternip_types#(Cfg)::RmsSqrtInputExponent),
-    .Implementation(Cfg.DivisionImplementation)
-) rms_value_reciprocal_divider (
+ternip_rsqrt #(
+    .AccWidth(RmsAccumulatorWidth),
+    .AccExponent(RmsSqaSumExponent),
+    .LenWidth(Cfg.ImmediateWidth),
+    .OutPrecision(RmsValueReciprocalPrecision),
+    .OutExponent(RmsValueReciprocalExponent)
+) rsqrt (
     .clk_i,
     .rst_ni,
-
-    .in_ready_o(div_in_ready),
-    .in_valid_i(div_in_valid),
-    .a_i(div_in_dividend),
-    .b_i(div_in_divisor),
-
-    .out_ready_i(div_out_ready),
-    .out_valid_o(div_out_valid),
-    .y_o(div_out_quotient)
+    .in_ready_o(rsqrt_in_ready),
+    .in_valid_i(rsqrt_in_valid),
+    .acc_i(rsqrt_acc_q),
+    .len_i(rsqrt_len_q),
+    .out_ready_i(rsqrt_out_ready),
+    .out_valid_o(rsqrt_out_valid),
+    .y_o(rsqrt_y)
 );
 
-logic                                rms_sqrt_in_ready;
-wire logic                           rms_sqrt_in_valid = div_out_valid;
-ternip_types#(Cfg)::rms_sqrt_input_t rms_sqrt_a;
-assign rms_sqrt_a = div_out_quotient;
 
-logic                                      rms_sqrt_out_ready;
-logic                                      rms_sqrt_out_valid;
-ternip_types#(Cfg)::rms_value_reciprocal_t rms_sqrt_y;
+// Norm: RP multipliers -> serial-to-parallel -> one chunk write
 
-assign div_out_ready = rms_sqrt_in_ready;
+logic [RP-1:0] norm_mul_in_ready, norm_mul_in_valid, norm_mul_out_ready, norm_mul_out_valid;
+lanes_t        norm_mul_out_result;
 
-ternip_sqrt #(
-    .InPrecision(ternip_types#(Cfg)::RmsSqrtInputPrecision),
-    .InExponent(ternip_types#(Cfg)::RmsSqrtInputExponent),
-    .OutPrecision(ternip_types#(Cfg)::RmsValueReciprocalPrecision),
-    .OutExponent(ternip_types#(Cfg)::RmsValueReciprocalExponent)
-) sqrt (
-    .clk_i,
-    .rst_ni,
-    .in_ready_o(rms_sqrt_in_ready),
-    .in_valid_i(rms_sqrt_in_valid),
-    .a_i(rms_sqrt_a),
-    .out_ready_i(rms_sqrt_out_ready),
-    .out_valid_o(rms_sqrt_out_valid),
-    .y_o(rms_sqrt_y)
-);
-
-// Precision Playground
-// https://www.desmos.com/calculator/z2je9ajel7
-
-
-// Norm
-
-logic [Cfg.VectorParallelism-1:0]          norm_mul_in_ready;
-logic [Cfg.VectorParallelism-1:0]          norm_mul_in_valid;
-ternip_types#(Cfg)::vector_chunk_t         norm_mul_in_a;
-ternip_types#(Cfg)::rms_value_reciprocal_t norm_mul_in_b;
-
-logic [Cfg.VectorParallelism-1:0]  norm_mul_out_ready;
-logic [Cfg.VectorParallelism-1:0]  norm_mul_out_valid;
-ternip_types#(Cfg)::vector_chunk_t norm_mul_out_result;
-
-ternip_types#(Cfg)::vector_chunk_t norm_mul_out_result_buffer_d, norm_mul_out_result_buffer_q;
-logic                              norm_mul_out_result_buffer_valid_d, norm_mul_out_result_buffer_valid_q;
-
-`ifndef SYNTHESIS
-// Verify that all norm_mul modules are synchronized
-// If all norm_mul modules are synchronized, then only norm_mul[0]'s control signals need to be read
-always_comb begin
-    assert ((!rst_ni || (&norm_mul_in_ready) == (|norm_mul_in_ready)))
-        else $fatal(0, "norm_mul_in_ready bits are not all uniform");
-    assert ((!rst_ni || (&norm_mul_in_valid) == (|norm_mul_in_valid)))
-        else $fatal(0, "norm_mul_in_valid bits are not all uniform");
-    assert ((!rst_ni || (&norm_mul_out_ready) == (|norm_mul_out_ready)))
-        else $fatal(0, "norm_mul_out_ready bits are not all uniform");
-    assert ((!rst_ni || (&norm_mul_out_valid) == (|norm_mul_out_valid)))
-        else $fatal(0, "norm_mul_out_valid bits are not all uniform");
-end
-`endif
-
-for (genvar i_GEN = 0; i_GEN < Cfg.VectorParallelism; i_GEN++) begin : parallel_norm_mul
-
+for (genvar i_GEN = 0; i_GEN < RP; i_GEN++) begin : parallel_norm_mul
     ternip_mul #(
         .InAPrecision(Cfg.FixedPointPrecision),
         .InAExponent(Cfg.FixedPointExponent),
-        .InBPrecision(ternip_types#(Cfg)::RmsValueReciprocalPrecision),
-        .InBExponent(ternip_types#(Cfg)::RmsValueReciprocalExponent),
+        .InBPrecision(RmsValueReciprocalPrecision),
+        .InBExponent(RmsValueReciprocalExponent),
         .OutPrecision(Cfg.FixedPointPrecision),
         .OutExponent(Cfg.FixedPointExponent),
         .FinalConversionNumPipelineStages(2)
     ) norm_mul (
         .clk_i,
         .rst_ni,
-
         .in_ready_o(norm_mul_in_ready[i_GEN]),
         .in_valid_i(norm_mul_in_valid[i_GEN]),
-        .a_i(norm_mul_in_a[i_GEN]),
-        .b_i(norm_mul_in_b),
-
+        .a_i(piso_lanes[i_GEN]),
+        .b_i(rms_value_reciprocal_q),
         .out_ready_i(norm_mul_out_ready[i_GEN]),
         .out_valid_o(norm_mul_out_valid[i_GEN]),
         .y_o(norm_mul_out_result[i_GEN])
     );
-
 end
 
+chunk_t                     sipo_data_d, sipo_data_q;
+logic [$clog2(Beats+1)-1:0] sipo_beat_d, sipo_beat_q;
+logic                       sipo_full_d, sipo_full_q;
 
-// State Machine
+`ifndef SYNTHESIS
+// All lanes of an RP group move together, so lane 0's handshakes stand for all.
+always_comb begin
+    assert (!rst_ni || ((&square_in_ready) == (|square_in_ready)));
+    assert (!rst_ni || ((&square_out_valid) == (|square_out_valid)));
+    assert (!rst_ni || ((&norm_mul_in_ready) == (|norm_mul_in_ready)));
+    assert (!rst_ni || ((&norm_mul_out_valid) == (|norm_mul_out_valid)));
+end
+// squarer outputs are not back-pressured during ACCUMULATE, so the accumulator must take them
+assert property (@(posedge clk_i) disable iff (!rst_ni)
+    (state_q == WORKING && rms_op_q == ternip_pkg::ACCUMULATE && accumulator_in_valid) |-> accumulator_in_ready)
+    else $fatal(1, "ternip_rms: accumulator not ready for a square result");
+`endif
+
+
+// State machine
+
+wire logic read_credit = (outstanding_q < ChunkFifoDepth) && (read_counter_q < NumChunksPerVector);
 
 always_comb begin
     in_ready_o = 0;
@@ -331,10 +325,20 @@ always_comb begin
     vector_request_vector_addr_o = 'x;
     vector_request_vector_select_o = 'x;
     vector_request_w_data_o = 'x;
-    vector_read_ready_o = 0;
+    // The core shares one read-response bus between FUs: only claim it while reading.
+    vector_read_ready_o = fifo_in_ready && (state_q == WORKING)
+                          && (rms_op_q == ternip_pkg::ACCUMULATE || rms_op_q == ternip_pkg::NORM);
 
-    vector_read_counter_d = vector_read_counter_q;
-    vector_processed_counter_d = vector_processed_counter_q;
+    read_counter_d = read_counter_q;
+    write_counter_d = write_counter_q;
+    beat_counter_d = beat_counter_q;
+    outstanding_d = outstanding_q;
+
+    piso_valid_d = piso_valid_q;
+    piso_data_d = piso_data_q;
+    piso_beat_d = piso_beat_q;
+    piso_take = 0;
+    fifo_out_yumi = 0;
 
     accumulator_in_valid = 0;
     accumulator_in_final = 'x;
@@ -342,27 +346,21 @@ always_comb begin
     accumulator_out_ready = 0;
 
     square_in_valid = '0;
-    square_operand_in = 'x;
     square_out_ready = '0;
 
-    div_in_valid = 0;
-    div_in_dividend = 'x;
-    div_in_divisor = 'x;
-
-    div_captured_dividend_d = div_captured_dividend_q;
-    div_captured_divisor_d  = div_captured_divisor_q;
+    rsqrt_acc_d = rsqrt_acc_q;
+    rsqrt_len_d = rsqrt_len_q;
+    rsqrt_in_valid = 0;
+    rsqrt_out_ready = 0;
 
     rms_value_reciprocal_d = rms_value_reciprocal_q;
     rms_value_reciprocal_valid_d = rms_value_reciprocal_valid_q;
 
     norm_mul_in_valid = '0;
-    norm_mul_in_a = 'x;
-    norm_mul_in_b = 'x;
     norm_mul_out_ready = '0;
-    norm_mul_out_result_buffer_d = norm_mul_out_result_buffer_q;
-    norm_mul_out_result_buffer_valid_d = norm_mul_out_result_buffer_valid_q;
-
-    rms_sqrt_out_ready = 0;
+    sipo_data_d = sipo_data_q;
+    sipo_beat_d = sipo_beat_q;
+    sipo_full_d = sipo_full_q;
 
     if (state_q == WAITING_FOR_IN) begin
         in_ready_o = 1;
@@ -371,14 +369,15 @@ always_comb begin
             in_vector1_select_d = in_vector1_select_i;
             in_vector2_select_d = in_vector2_select_i;
             in_rms_length_d = in_rms_length_i;
+            read_counter_d = 0;
+            write_counter_d = 0;
+            beat_counter_d = 0;
             if (in_rms_op_i == ternip_pkg::CLEAR) begin
                 state_d = SENDING_FINAL_TO_ACCUMULATOR;
                 rms_value_reciprocal_d = 'x;
                 rms_value_reciprocal_valid_d = 0;
             end else if (in_rms_op_i == ternip_pkg::ACCUMULATE) begin
                 state_d = WORKING;
-                vector_read_counter_d = 0;
-                vector_processed_counter_d = 0;
                 rms_value_reciprocal_d = 'x;
                 rms_value_reciprocal_valid_d = 0;
             end else if (in_rms_op_i == ternip_pkg::FINISH_ACCUMULATE) begin
@@ -387,8 +386,6 @@ always_comb begin
                 rms_value_reciprocal_valid_d = 0;
             end else if (in_rms_op_i == ternip_pkg::NORM) begin
                 state_d = WORKING;
-                vector_read_counter_d = 0;
-                vector_processed_counter_d = 0;
             end
         end
     end else if ((state_q == SENDING_FINAL_TO_ACCUMULATOR) && (rms_op_q == ternip_pkg::CLEAR)) begin
@@ -404,43 +401,38 @@ always_comb begin
         if (accumulator_out_valid) begin
             state_d = WAITING_FOR_IN;
             rms_op_d = ternip_pkg::NO_RMS_OP;
-            in_vector1_select_d = 'x;
-            in_vector2_select_d = 'x;
-            in_rms_length_d  = 'x;
         end
     end else if ((state_q == WORKING) && (rms_op_q == ternip_pkg::ACCUMULATE)) begin
-        if (vector_read_counter_q < ternip_types#(Cfg)::NumChunksPerVector) begin // read request
+        // read requests, limited by FIFO credits
+        if (read_credit) begin
             vector_request_valid_o = 1;
             vector_request_write_not_read_o = 0;
-            vector_request_vector_addr_o = vector_read_counter_q;
+            vector_request_vector_addr_o = read_counter_q;
             vector_request_vector_select_o = in_vector1_select_q;
-            if (vector_request_ready_i) vector_read_counter_d++;
+            if (vector_request_ready_i) begin
+                read_counter_d = read_counter_q + 1;
+                outstanding_d = outstanding_d + 1;
+            end
         end
-        // read response -> square
-        vector_read_ready_o = square_in_ready[0];
-        square_in_valid = {Cfg.VectorParallelism{ vector_read_valid_i }};
-        square_operand_in = vector_read_data_i;
-        // square -> accumulator
+        // PISO -> squarers
+        square_in_valid = {RP{piso_valid_q}};
+        piso_take = piso_valid_q && square_in_ready[0];
+        // squarers -> accumulator
         square_out_ready = '1;
         accumulator_in_valid = square_out_valid[0];
         accumulator_in_final = 0;
         accumulator_in_operand = square_result_out;
         if (accumulator_in_ready && accumulator_in_valid) begin
-            vector_processed_counter_d++;
-            if (vector_processed_counter_q == ternip_types#(Cfg)::NumChunksPerVector-1) begin
+            beat_counter_d = beat_counter_q + 1;
+            if (int'(beat_counter_q) == NumChunksPerVector * Beats - 1) begin
                 state_d = WAITING_FOR_IN;
                 rms_op_d = ternip_pkg::NO_RMS_OP;
-                in_vector1_select_d = 'x;
-                in_vector2_select_d = 'x;
-                in_rms_length_d  = 'x;
-                vector_read_counter_d = 'x;
-                vector_processed_counter_d = 'x;
             end
         end
     end else if ((state_q == SENDING_FINAL_TO_ACCUMULATOR) && (rms_op_q == ternip_pkg::FINISH_ACCUMULATE)) begin
         accumulator_in_valid = 1;
         accumulator_in_final = 1;
-        accumulator_in_operand = 0;
+        accumulator_in_operand = '0;
         accumulator_out_ready = 1;
         if (accumulator_in_ready) begin
             state_d = WAITING_FOR_ACCUMULATOR;
@@ -448,78 +440,79 @@ always_comb begin
     end else if ((state_q == WAITING_FOR_ACCUMULATOR) && (rms_op_q == ternip_pkg::FINISH_ACCUMULATE)) begin
         accumulator_out_ready = 1;
         if (accumulator_out_valid) begin
-            state_d = SENDING_TO_DIVIDER;
+            state_d = SENDING_TO_RSQRT;
             `ifndef SYNTHESIS
             assert(!rst_ni || $isunknown(in_rms_length_q) || (in_rms_length_q > 0));
             assert(!rst_ni || $isunknown(accumulator_out_result) || (accumulator_out_result >= 0)) else $fatal(0, "accumulator_out_result=%b", accumulator_out_result);
             `endif
-            div_captured_dividend_d = in_rms_length_q;
-            div_captured_divisor_d  = (accumulator_out_result <= 0) ? 1 /* TODO */ : accumulator_out_result;
+            rsqrt_acc_d = accumulator_out_result;   // <= 0 is clamped to one LSB inside ternip_rsqrt
+            rsqrt_len_d = in_rms_length_q;
         end
-    end else if ((state_q == SENDING_TO_DIVIDER) && (rms_op_q == ternip_pkg::FINISH_ACCUMULATE)) begin
-        // Drive the divider from the pipeline registers (breaks the MOA->div_bsg comb path).
-        div_in_valid = 1;
-        div_in_dividend = div_captured_dividend_q;
-        div_in_divisor  = div_captured_divisor_q;
-        if (div_in_ready) begin
+    end else if ((state_q == SENDING_TO_RSQRT) && (rms_op_q == ternip_pkg::FINISH_ACCUMULATE)) begin
+        rsqrt_in_valid = 1;
+        if (rsqrt_in_ready) begin
             state_d = WORKING;
         end
     end else if ((state_q == WORKING) && (rms_op_q == ternip_pkg::FINISH_ACCUMULATE)) begin
-        // wait for rms_value_reciprocal_divider -> ternip_sqrt -> valid
-        rms_sqrt_out_ready = 1;
-        if (rms_sqrt_out_valid) begin
-            rms_value_reciprocal_d = rms_sqrt_y;
+        rsqrt_out_ready = 1;
+        if (rsqrt_out_valid) begin
+            rms_value_reciprocal_d = rsqrt_y;
             rms_value_reciprocal_valid_d = 1;
             state_d = WAITING_FOR_IN;
             rms_op_d = ternip_pkg::NO_RMS_OP;
-            in_vector1_select_d = 'x;
-            in_vector2_select_d = 'x;
-            in_rms_length_d  = 'x;
         end
     end else if ((state_q == WORKING) && (rms_op_q == ternip_pkg::NORM)) begin
-        // read response -> multiplier
-        vector_read_ready_o = norm_mul_in_ready[0];
-        norm_mul_in_valid = {Cfg.VectorParallelism{ vector_read_valid_i }};
-        norm_mul_in_a = vector_read_data_i;
-        norm_mul_in_b = rms_value_reciprocal_q;
-
-        // buffer -> write request
-        if (norm_mul_out_result_buffer_valid_q) begin
+        // a completed chunk is written first; otherwise request a read (credit-limited)
+        if (sipo_full_q) begin
             vector_request_valid_o = 1;
             vector_request_write_not_read_o = 1;
-            vector_request_vector_addr_o = vector_processed_counter_q;
-            vector_request_w_data_o = norm_mul_out_result_buffer_q;
+            vector_request_vector_addr_o = write_counter_q;
+            vector_request_w_data_o = sipo_data_q;
             vector_request_vector_select_o = in_vector2_select_q;
             if (vector_request_ready_i) begin
-                norm_mul_out_result_buffer_d = 'x;
-                norm_mul_out_result_buffer_valid_d = 0;
-                vector_processed_counter_d++;
-                if (vector_processed_counter_q >= ternip_types#(Cfg)::NumChunksPerVector-1) begin
+                sipo_full_d = 0;
+                write_counter_d = write_counter_q + 1;
+                if (int'(write_counter_q) == NumChunksPerVector - 1) begin
                     state_d = WAITING_FOR_IN;
                     rms_op_d = ternip_pkg::NO_RMS_OP;
-                    in_vector1_select_d = 'x;
-                    in_vector2_select_d = 'x;
-                    in_rms_length_d  = 'x;
-                    vector_read_counter_d = 'x;
-                    vector_processed_counter_d = 'x;
                 end
             end
-        end else if (vector_read_counter_q < ternip_types#(Cfg)::NumChunksPerVector) begin // read request
-            // if a read was just received, do not do another read
+        end else if (read_credit) begin
             vector_request_valid_o = 1;
             vector_request_write_not_read_o = 0;
-            vector_request_vector_addr_o = vector_read_counter_q;
+            vector_request_vector_addr_o = read_counter_q;
             vector_request_vector_select_o = in_vector1_select_q;
-            if (vector_request_ready_i && vector_request_valid_o) begin
-                vector_read_counter_d++;
+            if (vector_request_ready_i) begin
+                read_counter_d = read_counter_q + 1;
+                outstanding_d = outstanding_d + 1;
             end
         end
-
-        // multiplier -> buffer
-        norm_mul_out_ready = {Cfg.VectorParallelism{ !norm_mul_out_result_buffer_valid_q || vector_request_ready_i }};
+        // PISO -> multipliers
+        norm_mul_in_valid = {RP{piso_valid_q}};
+        piso_take = piso_valid_q && norm_mul_in_ready[0];
+        // multipliers -> SIPO (accept while the SIPO has room, or as its chunk is written)
+        norm_mul_out_ready = {RP{ !sipo_full_q || (vector_request_valid_o && vector_request_write_not_read_o && vector_request_ready_i) }};
         if (norm_mul_out_ready[0] && norm_mul_out_valid[0]) begin
-            norm_mul_out_result_buffer_d = norm_mul_out_result;
-            norm_mul_out_result_buffer_valid_d = 1;
+            for (int r = 0; r < RP; r++) sipo_data_d[int'(sipo_beat_q) * RP + r] = norm_mul_out_result[r];
+            if (int'(sipo_beat_q) == Beats - 1) begin
+                sipo_beat_d = 0;
+                sipo_full_d = 1;
+            end else begin
+                sipo_beat_d = sipo_beat_q + 1;
+            end
+        end
+    end
+
+    // PISO advance / refill from the chunk FIFO
+    if (piso_take && !piso_last) begin
+        piso_beat_d = piso_beat_q + 1;
+    end else if (!piso_valid_q || (piso_take && piso_last)) begin
+        piso_valid_d = fifo_out_valid;
+        piso_beat_d = 0;
+        if (fifo_out_valid) begin
+            fifo_out_yumi = 1;
+            piso_data_d = fifo_out_data;
+            outstanding_d = outstanding_d - 1;
         end
     end
 end
@@ -528,39 +521,49 @@ always_ff @(posedge clk_i) begin
     if (!rst_ni) begin
         state_q <= WAITING_FOR_IN;
         rms_value_reciprocal_valid_q <= 0;
-        norm_mul_out_result_buffer_valid_q <= 0;
+        outstanding_q <= '0;
+        piso_valid_q <= 0;
+        piso_beat_q <= '0;
+        sipo_full_q <= 0;
+        sipo_beat_q <= '0;
     end else begin
         state_q <= state_d;
         rms_value_reciprocal_valid_q <= rms_value_reciprocal_valid_d;
-        norm_mul_out_result_buffer_valid_q <= norm_mul_out_result_buffer_valid_d;
+        outstanding_q <= outstanding_d;
+        piso_valid_q <= piso_valid_d;
+        piso_beat_q <= piso_beat_d;
+        sipo_full_q <= sipo_full_d;
+        sipo_beat_q <= sipo_beat_d;
     end
 end
 always_ff @(posedge clk_i) begin
     rms_op_q <= rms_op_d;
-    vector_read_counter_q <= vector_read_counter_d;
-    vector_processed_counter_q <= vector_processed_counter_d;
+    read_counter_q <= read_counter_d;
+    write_counter_q <= write_counter_d;
+    beat_counter_q <= beat_counter_d;
 
     in_vector1_select_q <= in_vector1_select_d;
     in_vector2_select_q <= in_vector2_select_d;
     in_rms_length_q <= in_rms_length_d;
 
     rms_value_reciprocal_q <= rms_value_reciprocal_d;
-    norm_mul_out_result_buffer_q <= norm_mul_out_result_buffer_d;
+    piso_data_q <= piso_data_d;
+    sipo_data_q <= sipo_data_d;
 
-    div_captured_dividend_q <= div_captured_dividend_d;
-    div_captured_divisor_q  <= div_captured_divisor_d;
+    rsqrt_acc_q <= rsqrt_acc_d;
+    rsqrt_len_q <= rsqrt_len_d;
     `ifndef SYNTHESIS
     if (!rst_ni) begin
         rms_op_q <= ternip_pkg::NO_RMS_OP;
-        vector_read_counter_q <= 'x;
-        vector_processed_counter_q <= 'x;
+        read_counter_q <= 'x;
+        write_counter_q <= 'x;
+        beat_counter_q <= 'x;
 
         in_vector1_select_q <= 'x;
         in_vector2_select_q <= 'x;
         in_rms_length_q <= 'x;
 
         rms_value_reciprocal_q <= 'x;
-        norm_mul_out_result_buffer_q <= 'x;
     end
     `endif
 end
