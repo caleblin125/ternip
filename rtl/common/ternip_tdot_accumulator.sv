@@ -33,8 +33,11 @@
 // handshake, accumulator width, per-beat accumulator saturation and final clip to
 // result_t match ternip_multioperand_accumulator with NEXT_STAGE_FANIN=2 and
 // operand_t = logic signed [ACT_WIDTH:0], so every Arith setting is a drop-in
-// replacement for the ternip_tmatmul baseline datapath. The output FIFO is one
-// entry deeper (see output_fifo), and CSA / GPC pipelines may be shallower.
+// replacement for the ternip_tmatmul baseline datapath. Differences: in_ready
+// waits on output-FIFO credits rather than an empty output register, so the
+// ones'-complement modes take a beat every cycle across group boundaries (the
+// baseline drops one beat per group); the FIFO is deeper to match; and CSA / GPC
+// pipelines may be shallower.
 //
 // Arith:
 //  TDOT_TWOS_ADDER_TREE: +/-act two's-complement products into
@@ -584,6 +587,22 @@ end else begin : ones
 
     assign fifo_out_ready = !out_valid_q || out_ready_i;
 
+    // Output credits: results owed to the output FIFO (final beats accepted, not yet
+    // popped). in_ready only needs a free FIFO slot for every result in flight, so a
+    // drained output costs no input cycle. (Gating on !out_valid_q instead dropped one
+    // beat per group: 8/9 of the stream at D/TmatmulParallelism = 8.)
+    // In steady state at one-beat groups NumStages+3 results are owed (pipeline,
+    // accumulator, FIFO write-to-read), so OutputFifoEls = NumStages+4 never throttles.
+    localparam int OutputFifoEls = NumStages + 4;
+    logic [$clog2(OutputFifoEls+1)-1:0] credits_used_d, credits_used_q;
+    wire credit_take = in_ready_o && in_valid_i && in_final_i;
+    wire credit_return = fifo_out_ready && fifo_out_valid;
+    always_comb begin
+        credits_used_d = credits_used_q;
+        if (credit_take && !credit_return) credits_used_d = credits_used_q + 1'b1;
+        if (!credit_take && credit_return) credits_used_d = credits_used_q - 1'b1;
+    end
+
     assign out_valid_o = out_valid_q;
     always_comb begin
         out_result_o = out_result_q;
@@ -616,7 +635,7 @@ end else begin : ones
             if (final_pipeline_q[NumStages])
                 state_d = WORKING;
         end else if (state_q == WORKING) begin
-            in_ready_o = !out_valid_q;
+            in_ready_o = (credits_used_q < OutputFifoEls);
             fifo_in_valid = final_pipeline_q[NumStages];
             valid_pipeline_d = {valid_pipeline_q, (in_ready_o && in_valid_i)};
             final_pipeline_d = {final_pipeline_q, (in_ready_o && in_valid_i && in_final_i)};
@@ -655,10 +674,13 @@ end else begin : ones
     end
 
     always_ff @(posedge clk_i) begin
-        if (!rst_ni)
+        if (!rst_ni) begin
             out_valid_q <= 1'b0;
-        else
+            credits_used_q <= '0;
+        end else begin
             out_valid_q <= out_valid_d;
+            credits_used_q <= credits_used_d;
+        end
     end
     always_ff @(posedge clk_i) begin
         out_result_q <= out_result_d;
@@ -668,13 +690,12 @@ end else begin : ones
     end
 
     // https://github.com/bespoke-silicon-group/basejump_stl/blob/a43571d2/bsg_dataflow/bsg_fifo_1r1w_small.sv
-    // in_ready_o falls NumStages+3 cycles after the first accepted final beat, so
-    // back-to-back one-beat groups against a stalled output leave NumStages+3
-    // results in flight: NumStages+2 here plus the output register.
-    // (ternip_multioperand_accumulator uses NumStages+1, one short.)
+    // Sized by the credits above: at most OutputFifoEls results are ever owed to it.
+    // (ternip_multioperand_accumulator gates on its output register instead and uses
+    // NumStages+1 entries, one short for back-to-back one-beat groups.)
     bsg_fifo_1r1w_small #(
         .width_p($bits(result_t)),
-        .els_p(NumStages + 2),
+        .els_p(OutputFifoEls),
         .harden_p(0),
         .ready_THEN_valid_p(0)
     ) output_fifo (
@@ -692,6 +713,8 @@ end else begin : ones
 
     assert property (@(posedge clk_i) disable iff (!rst_ni) fifo_in_valid |-> fifo_in_ready)
         else $fatal(0, "Output FIFO overflow");
+    assert property (@(posedge clk_i) disable iff (!rst_ni) credits_used_q <= OutputFifoEls)
+        else $fatal(0, "Output credits overflow");
 
 end
 

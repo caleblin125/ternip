@@ -141,18 +141,35 @@ enum logic [1:0] {
 
 ternip_pkg::tmatmul_op_e tmatmul_operation_d, tmatmul_operation_q;
 // =========================================================================
-// Manual forward retiming of state_q and tmatmul_operation_q to avoid high fanout in the FSM
+// Manual forward retiming of state_q and tmatmul_operation_q to avoid high fanout in the FSM.
+// The flags are set directly by each transition in the FSM below (not decoded from
+// state_d / tmatmul_operation_d), so each flag's next value only depends on the inputs of
+// the transitions that can change it. Decoding pulled the shared weight-stream ready
+// (ddr_stream_ready_i, from another core) into in_state_working_import_d, which only a
+// dispatch from WAITING_FOR_IN can set: the 300 MHz critical path at 156 cores.
 logic in_state_working_import_d, in_state_working_import_q;
 logic in_state_working_go_d, in_state_working_go_q;
 logic in_state_working_export_d, in_state_working_export_q;
 logic in_state_waiting_for_in_d, in_state_waiting_for_in_q;
 logic in_state_waiting_for_ddr_go_d, in_state_waiting_for_ddr_go_q;
 
-assign in_state_working_import_d     = (state_d == WORKING) && (tmatmul_operation_d == ternip_pkg::IMPORT);
-assign in_state_working_go_d         = (state_d == WORKING) && (tmatmul_operation_d == ternip_pkg::GO);
-assign in_state_working_export_d     = (state_d == WORKING) && (tmatmul_operation_d == ternip_pkg::EXPORT);
-assign in_state_waiting_for_in_d     = (state_d == WAITING_FOR_IN);
-assign in_state_waiting_for_ddr_go_d = (state_d == WAITING_FOR_DDR_STREAM_READY) && (tmatmul_operation_d == ternip_pkg::GO);
+// IMPORT ends one cycle after its last importvector write, so the import gearbox's
+// all-lanes-full valid only reaches this register, not the replicated flags.
+logic import_last_d, import_last_q;
+
+`ifndef SYNTHESIS
+always @(posedge clk_i) if (rst_ni) begin
+    assert ({in_state_working_import_q, in_state_working_go_q, in_state_working_export_q,
+             in_state_waiting_for_in_q, in_state_waiting_for_ddr_go_q} ==
+            {(state_q == WORKING) && (tmatmul_operation_q == ternip_pkg::IMPORT),
+             (state_q == WORKING) && (tmatmul_operation_q == ternip_pkg::GO),
+             (state_q == WORKING) && (tmatmul_operation_q == ternip_pkg::EXPORT),
+             (state_q == WAITING_FOR_IN),
+             (state_q == WAITING_FOR_DDR_STREAM_READY) && (tmatmul_operation_q == ternip_pkg::GO)})
+        else $fatal(1, "tmatmul state flags disagree with state_q / tmatmul_operation_q");
+end
+`endif
+
 always_ff @(posedge clk_i) begin
     if (!rst_ni) begin
         in_state_working_import_q     <= '0;
@@ -160,12 +177,14 @@ always_ff @(posedge clk_i) begin
         in_state_working_export_q     <= '0;
         in_state_waiting_for_in_q     <= '1;
         in_state_waiting_for_ddr_go_q <= '0;
+        import_last_q                 <= '0;
     end else begin
         in_state_working_import_q     <= in_state_working_import_d;
         in_state_working_go_q         <= in_state_working_go_d;
         in_state_working_export_q     <= in_state_working_export_d;
         in_state_waiting_for_in_q     <= in_state_waiting_for_in_d;
         in_state_waiting_for_ddr_go_q <= in_state_waiting_for_ddr_go_d;
+        import_last_q                 <= import_last_d;
     end
 end
 // =========================================================================
@@ -442,6 +461,13 @@ always_comb begin
     state_d = state_q;
     in_ready_o = 0;
 
+    in_state_working_import_d     = in_state_working_import_q;
+    in_state_working_go_d         = in_state_working_go_q;
+    in_state_working_export_d     = in_state_working_export_q;
+    in_state_waiting_for_in_d     = in_state_waiting_for_in_q;
+    in_state_waiting_for_ddr_go_d = in_state_waiting_for_ddr_go_q;
+    import_last_d                 = import_last_q;
+
     queued_valid_d = queued_valid_q;
     queued_operation_d = queued_operation_q;
     queued_vector_select_d = queued_vector_select_q;
@@ -522,6 +548,13 @@ always_comb begin
             state_d = (tmatmul_operation_d == ternip_pkg::GO) ? (WAITING_FOR_DDR_STREAM_READY) : (WORKING);
         end
 
+        if (queued_valid_q || in_valid_i) begin
+            in_state_waiting_for_in_d     = 0;
+            in_state_waiting_for_ddr_go_d = (tmatmul_operation_d == ternip_pkg::GO);
+            in_state_working_import_d     = (tmatmul_operation_d == ternip_pkg::IMPORT);
+            in_state_working_export_d     = (tmatmul_operation_d == ternip_pkg::EXPORT);
+        end
+
     // end else if ((state_q == WAITING_FOR_DDR_STREAM_READY) && (tmatmul_operation_q == ternip_pkg::GO)) begin // manual forward retiming
     end else if (in_state_waiting_for_ddr_go_q) begin
 
@@ -529,6 +562,8 @@ always_comb begin
         if (ddr_stream_ready_i) begin
             ddr_stream_address_o = ddr_stream_address_q;
             state_d = WORKING;
+            in_state_waiting_for_ddr_go_d = 0;
+            in_state_working_go_d = 1;
         end
 
     // end else if ((state_q == WORKING) && (tmatmul_operation_q == ternip_pkg::IMPORT)) begin // manual forward retiming
@@ -547,7 +582,7 @@ always_comb begin
         import_skid_in_valid = vector_read_valid_i;
 
         // Receive deserialized elements from adapter and write to BRAMs
-        gbfifo_import_out_ready = importvector_request_ready;
+        gbfifo_import_out_ready = importvector_request_ready && !import_last_q;
         if (gbfifo_import_out_ready && gbfifo_import_out_valid) begin
             importvector_request_valid = 1;
             importvector_request_write_not_read = 1;
@@ -555,10 +590,15 @@ always_comb begin
             importvector_request_w_data = gbfifo_import_out_data;
 
             import_bram_addr_d++;
-            if (import_bram_addr_q >= DdrReadsPerRow-1) begin
-                state_d = WAITING_FOR_IN;
-                tmatmul_operation_d = ternip_pkg::NO_TMATMUL_OP;
-            end
+            if (import_bram_addr_q >= DdrReadsPerRow-1) import_last_d = 1;
+        end
+
+        if (import_last_q) begin
+            import_last_d = 0;
+            state_d = WAITING_FOR_IN;
+            tmatmul_operation_d = ternip_pkg::NO_TMATMUL_OP;
+            in_state_working_import_d = 0;
+            in_state_waiting_for_in_d = 1;
         end
 
     // end else if ((state_q == WORKING) && (tmatmul_operation_q == ternip_pkg::GO)) begin // manual forward retiming
@@ -620,6 +660,8 @@ always_comb begin
                 state_d = WAITING_FOR_IN;
                 tmatmul_operation_d = ternip_pkg::NO_TMATMUL_OP;
                 exportvector_counter_d = 0;
+                in_state_working_go_d = 0;
+                in_state_waiting_for_in_d = 1;
             end
         end
 
@@ -645,6 +687,8 @@ always_comb begin
             if (exportvector_read_addr >= NumChunksPerVector-1) begin
                 state_d = WAITING_FOR_IN;
                 tmatmul_operation_d = ternip_pkg::NO_TMATMUL_OP;
+                in_state_working_export_d = 0;
+                in_state_waiting_for_in_d = 1;
             end
         end
 
