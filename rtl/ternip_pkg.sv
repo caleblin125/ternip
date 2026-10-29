@@ -119,9 +119,14 @@ typedef enum logic [1:0] {
 //  TERNARY_PACKED5: 5 trits per byte, base 3: byte = d0 + 3*d1 + 9*d2 + 27*d3 + 81*d4,
 //                   digit 0=-1, 1=0, 2=+1. Each beat of TmatmulParallelism trits is
 //                   padded to ceil(TmatmulParallelism/5) bytes with digit 1.
-typedef enum logic [0:0] {
+//  TERNARY_PAIR4:   2 bits per trit as one 4-bit pair code per lane pair (2q, 2q+1), in the
+//                   bits TERNARY_2BIT gives that pair: {nonzero, sign, entry[1:0]}, entry
+//                   0..3 = (1,0), (0,1), (1,1), (1,-1), sign negates, (0,0) = 4'b0000. Read
+//                   by the pair-table datapath (ternip_tdot_pair_tables), no trit decode.
+typedef enum logic [1:0] {
     TERNARY_2BIT,
-    TERNARY_PACKED5
+    TERNARY_PACKED5,
+    TERNARY_PAIR4
 } ternary_encoding_e;
 
 // Base-3 unpacking for TERNARY_PACKED5.

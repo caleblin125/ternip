@@ -43,6 +43,9 @@
 // Decoder the base-3 unpacker for TERNARY_PACKED5, and Arith/Correction the
 // dot-product datapath (see ternip_tdot_accumulator). The defaults from
 // ternip_pkg (TERNARY_2BIT, TDOT_TWOS_ADDER_TREE) are the original datapath.
+// TERNARY_PAIR4 replaces the importvector and its gearbox with pair tables
+// (ternip_tdot_pair_tables): IMPORT writes {a, b, a+b, a-b} per lane pair, GO reads
+// one table entry per 4-bit pair code. It needs a ones'-complement Arith.
 
 `define SAFE_CLOG2(x) ( (((x)==1) || ((x)==0))? 1 : $clog2((x)))
 
@@ -232,6 +235,7 @@ localparam bit DirectPacked = (Encoding == ternip_pkg::TERNARY_PACKED5)
                            && (Decoder == ternip_pkg::TRIT5_DECODE_DIRECT);
 localparam int AccumulatorPackedBytes = DirectPacked ? (StreamWidth / 8) : 0;
 localparam int AccumulatorPackedWidth = DirectPacked ? StreamWidth : 1;
+localparam bit Tlut = (Encoding == ternip_pkg::TERNARY_PAIR4);
 
 logic [TmatmulParallelism-1:0] weight_pos, weight_neg;
 ternary_t [TmatmulParallelism-1:0] ddr_r_trits;
@@ -267,6 +271,12 @@ end else if (Encoding == ternip_pkg::TERNARY_PACKED5) begin : packed5
     for (genvar i_GEN = 0; i_GEN < TmatmulParallelism; i_GEN++) begin : lane
         assign ddr_r_trits[i_GEN] = weight_pos[i_GEN] ? ternary_t'(1) : (weight_neg[i_GEN] ? ternary_t'(-1) : ternary_t'(0));
     end
+end else if (Tlut) begin : pair4
+    // the pair tables read the codes straight from ddr_r_data_i
+    assign accumulator_packed = '0;
+    assign weight_pos = '0;
+    assign weight_neg = '0;
+    assign ddr_r_trits = '0;
 end else begin : trit2
     assign accumulator_packed = '0;
     assign ddr_r_trits = ddr_r_data_i;
@@ -285,7 +295,9 @@ fixed_point_t [ImportVectorRowWidth-1:0] importvector_read_data;
 
 for (genvar i_GEN = 0; i_GEN < RowParallelism; i_GEN++) begin : row
 
-    if (Arith == ternip_pkg::TDOT_TWOS_ADDER_TREE) begin : twos
+    if (Tlut) begin : pair_tables_row
+        // ternip_tdot_pair_tables below drives this row
+    end else if (Arith == ternip_pkg::TDOT_TWOS_ADDER_TREE) begin : twos
         ternip_multioperand_accumulator #(
             .Cfg(Cfg),
             .operand_t(tmul_result_t),
@@ -346,24 +358,31 @@ logic importvector_read_ready;
 logic importvector_read_valid;
 logic [`SAFE_CLOG2(DdrReadsPerRow)-1:0] importvector_read_addr;
 
-ternip_pipelined_mem #(
-    .DATA_WIDTH($bits(importvector_read_data)),
-    .NUM_ENTRIES(DdrReadsPerRow)
-) importvector (
-    .clk_i,
-    .rst_ni,
+if (!Tlut) begin : g_importvector
+    ternip_pipelined_mem #(
+        .DATA_WIDTH($bits(importvector_read_data)),
+        .NUM_ENTRIES(DdrReadsPerRow)
+    ) importvector (
+        .clk_i,
+        .rst_ni,
 
-    .request_ready_o(importvector_request_ready),
-    .request_valid_i(importvector_request_valid),
-    .request_write_not_read_i(importvector_request_write_not_read),
-    .request_addr_i(importvector_request_addr),
-    .request_w_data_i(importvector_request_w_data),
+        .request_ready_o(importvector_request_ready),
+        .request_valid_i(importvector_request_valid),
+        .request_write_not_read_i(importvector_request_write_not_read),
+        .request_addr_i(importvector_request_addr),
+        .request_w_data_i(importvector_request_w_data),
 
-    .read_ready_i(importvector_read_ready),
-    .read_valid_o(importvector_read_valid),
-    .read_addr_o(importvector_read_addr),
-    .read_data_o(importvector_read_data)
-);
+        .read_ready_i(importvector_read_ready),
+        .read_valid_o(importvector_read_valid),
+        .read_addr_o(importvector_read_addr),
+        .read_data_o(importvector_read_data)
+    );
+end else begin : g_no_importvector
+    assign importvector_request_ready = 1'b1;
+    assign importvector_read_valid = 1'b0;
+    assign importvector_read_addr = '0;
+    assign importvector_read_data = '0;
+end
 
 // Export Vector
 logic exportvector_request_ready;
@@ -423,22 +442,71 @@ bsg_two_fifo #(
 assign gbfifo_import_in_valid = import_skid_out_valid;
 assign gbfifo_import_in_data = import_skid_out_data;
 
-// IMPORT gearbox_fifo: vector_chunk_t -> fixed_point_t [TmatmulParallelism-1:0]
-ternip_gearbox_fifo #(
-    .InDataWidth($bits(gbfifo_import_in_data)),
-    .OutDataWidth($bits(gbfifo_import_out_data))
-) gbfifo_import (
-    .clk_i,
-    .rst_ni,
+if (!Tlut) begin : g_import_gearbox
+    // IMPORT gearbox_fifo: vector_chunk_t -> fixed_point_t [TmatmulParallelism-1:0]
+    ternip_gearbox_fifo #(
+        .InDataWidth($bits(gbfifo_import_in_data)),
+        .OutDataWidth($bits(gbfifo_import_out_data))
+    ) gbfifo_import (
+        .clk_i,
+        .rst_ni,
 
-    .in_ready_o(gbfifo_import_in_ready),
-    .in_valid_i(gbfifo_import_in_valid),
-    .in_data_i(gbfifo_import_in_data),
+        .in_ready_o(gbfifo_import_in_ready),
+        .in_valid_i(gbfifo_import_in_valid),
+        .in_data_i(gbfifo_import_in_data),
 
-    .out_ready_i(gbfifo_import_out_ready),
-    .out_valid_o(gbfifo_import_out_valid),
-    .out_data_o(gbfifo_import_out_data)
-);
+        .out_ready_i(gbfifo_import_out_ready),
+        .out_valid_o(gbfifo_import_out_valid),
+        .out_data_o(gbfifo_import_out_data)
+    );
+end else begin : g_no_import_gearbox
+    // the pair tables take every chunk as it comes
+    assign gbfifo_import_in_ready = 1'b1;
+    assign gbfifo_import_out_valid = 1'b0;
+    assign gbfifo_import_out_data = '0;
+end
+
+// Pair tables (TERNARY_PAIR4): IMPORT chunks straight from the skid, GO codes straight
+// from ddr_r_data_i, results into the export gearbox like the row accumulators.
+logic tlut_imp_busy;
+logic tlut_go_ready, tlut_go_valid, tlut_go_final;
+logic [$clog2(NumChunksPerVector+1)-1:0] import_chunk_counter_d, import_chunk_counter_q;
+
+if (Tlut) begin : pair_tables
+    ternip_tdot_pair_tables #(
+        .NUM_LANES(ImportVectorRowWidth),
+        .ROW_PARALLELISM(RowParallelism),
+        .ROWS(DdrReadsPerRow),
+        .ACT_WIDTH(FixedPointPrecision),
+        .IMPORT_WIDTH(VectorParallelism),
+        .result_t(fixed_point_t),
+        .Arith(Arith),
+        .Correction(Correction),
+        .GPC_K(ternip_pkg::TmatmulGpcK),
+        .GPC_FINAL_ROWS(ternip_pkg::TmatmulGpcFinalRows),
+        .GPC_ADD(ternip_pkg::TmatmulGpcAdd),
+        .D(D)
+    ) tables (
+        .clk_i,
+        .rst_ni,
+        .imp_clear_i(in_state_waiting_for_in_q),
+        .imp_valid_i(import_skid_out_valid),
+        .imp_act_i(import_skid_out_data),
+        .imp_busy_o(tlut_imp_busy),
+        .go_ready_o(tlut_go_ready),
+        .go_valid_i(tlut_go_valid),
+        .go_final_i(tlut_go_final),
+        .go_row_i(importvector_request_addr_counter_q[`SAFE_CLOG2(DdrReadsPerRow)-1:0]),
+        .go_codes_i(ddr_r_data_i),
+        .out_ready_i(accumulator_out_ready),
+        .out_valid_o(accumulator_out_valid),
+        .out_result_o(accumulator_result)
+    );
+    assign accumulator_in_ready = '1;
+end else begin : g_no_pair_tables
+    assign tlut_imp_busy = 1'b0;
+    assign tlut_go_ready = 1'b0;
+end
 
 // EXPORT (GO) gearbox_fifo: fixed_point_t -> vector_chunk_t
 ternip_gearbox_fifo #(
@@ -467,6 +535,9 @@ always_comb begin
     in_state_waiting_for_in_d     = in_state_waiting_for_in_q;
     in_state_waiting_for_ddr_go_d = in_state_waiting_for_ddr_go_q;
     import_last_d                 = import_last_q;
+    import_chunk_counter_d        = import_chunk_counter_q;
+    tlut_go_valid                 = 0;
+    tlut_go_final                 = 0;
 
     queued_valid_d = queued_valid_q;
     queued_operation_d = queued_operation_q;
@@ -527,6 +598,7 @@ always_comb begin
         exportvector_counter_d = 0;
         importvector_request_addr_counter_d = 0;
         import_bram_addr_d = 0;
+        import_chunk_counter_d = 0;
 
         if (queued_valid_q) begin
             queued_valid_d = 0;
@@ -581,19 +653,28 @@ always_comb begin
         vector_read_ready_o = import_skid_in_ready;
         import_skid_in_valid = vector_read_valid_i;
 
-        // Receive deserialized elements from adapter and write to BRAMs
-        gbfifo_import_out_ready = importvector_request_ready && !import_last_q;
-        if (gbfifo_import_out_ready && gbfifo_import_out_valid) begin
-            importvector_request_valid = 1;
-            importvector_request_write_not_read = 1;
-            importvector_request_addr = import_bram_addr_q;
-            importvector_request_w_data = gbfifo_import_out_data;
+        if (Tlut) begin
+            // the pair tables take each chunk off the skid; done once the last
+            // chunk is in and the table write buses are idle
+            if (import_skid_out_valid) begin
+                import_chunk_counter_d++;
+                if (import_chunk_counter_q >= NumChunksPerVector-1) import_last_d = 1;
+            end
+        end else begin
+            // Receive deserialized elements from adapter and write to BRAMs
+            gbfifo_import_out_ready = importvector_request_ready && !import_last_q;
+            if (gbfifo_import_out_ready && gbfifo_import_out_valid) begin
+                importvector_request_valid = 1;
+                importvector_request_write_not_read = 1;
+                importvector_request_addr = import_bram_addr_q;
+                importvector_request_w_data = gbfifo_import_out_data;
 
-            import_bram_addr_d++;
-            if (import_bram_addr_q >= DdrReadsPerRow-1) import_last_d = 1;
+                import_bram_addr_d++;
+                if (import_bram_addr_q >= DdrReadsPerRow-1) import_last_d = 1;
+            end
         end
 
-        if (import_last_q) begin
+        if (import_last_q && !tlut_imp_busy) begin
             import_last_d = 0;
             state_d = WAITING_FOR_IN;
             tmatmul_operation_d = ternip_pkg::NO_TMATMUL_OP;
@@ -613,8 +694,20 @@ always_comb begin
             queued_valid_d = 1;
         end
 
-        // Request read from importvector
-        if (importvector_counter_q < DdrReadsPerMatrix) begin
+        if (Tlut) begin
+            // one DDR beat of pair codes per table lookup, rows in import order
+            if (importvector_counter_q < DdrReadsPerMatrix) begin
+                ddr_r_ready_o = tlut_go_ready;
+                if (ddr_r_valid_i && tlut_go_ready) begin
+                    tlut_go_valid = 1;
+                    tlut_go_final = (importvector_request_addr_counter_q == DdrReadsPerRow-1);
+                    importvector_counter_d++;
+                    importvector_request_addr_counter_d++;
+                    if (importvector_request_addr_counter_q == DdrReadsPerRow-1) importvector_request_addr_counter_d = 0;
+                end
+            end
+        end else if (importvector_counter_q < DdrReadsPerMatrix) begin
+            // Request read from importvector
             importvector_request_valid = '1;
             importvector_request_write_not_read = '0;
             importvector_request_addr = importvector_request_addr_counter_q;
@@ -716,6 +809,7 @@ always_ff @(posedge clk_i) begin
     importvector_request_addr_counter_q <= importvector_request_addr_counter_d;
     exportvector_counter_q <= exportvector_counter_d;
     import_bram_addr_q <= import_bram_addr_d;
+    import_chunk_counter_q <= import_chunk_counter_d;
     `ifndef SYNTHESIS
     if (!rst_ni) begin
         vector_select_q <= 'x;
@@ -729,6 +823,7 @@ always_ff @(posedge clk_i) begin
         importvector_request_addr_counter_q <= 'x;
         exportvector_counter_q <= 'x;
         import_bram_addr_q <= 'x;
+        import_chunk_counter_q <= 'x;
     end
     `endif
 end
