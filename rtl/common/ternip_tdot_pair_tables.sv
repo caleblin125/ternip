@@ -130,8 +130,10 @@ always_ff @(posedge clk_i) begin
 end
 
 for (genvar m_GEN = 0; m_GEN < NumBuses; m_GEN++) begin : bus
-    wire op_t a = op_t'(bus_a_q[m_GEN]);
-    wire op_t b = op_t'(bus_b_q[m_GEN]);
+    // explicit sign extension: sv2v flattens bus_a_q, and a part-select is unsigned, so a
+    // cast would zero-extend in the netlist synthesis reads
+    wire op_t a = {bus_a_q[m_GEN][ACT_WIDTH-1], bus_a_q[m_GEN]};
+    wire op_t b = {bus_b_q[m_GEN][ACT_WIDTH-1], bus_b_q[m_GEN]};
     always_comb begin
         unique case (bus_phase_q[m_GEN])
             2'd0: bus_w_data[m_GEN] = a;
