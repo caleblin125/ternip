@@ -297,6 +297,12 @@ localparam bit                TmatmulGpcAdd       = `TERNIP_TMATMUL_GPC_ADD;
 `endif
 localparam weight_dist_e WeightDistribution = `TERNIP_WEIGHT_DIST;
 
+// Load/store gearboxes for VP x BatchSize x 16 not a multiple of the DDR width: 1 = gcd chain
+// (moves gcd(width, DDR width) bits per cycle; slow when that gcd is small), 0 = staging shifter.
+`ifndef TERNIP_LOADSTORE_GEARBOX_GCD
+`define TERNIP_LOADSTORE_GEARBOX_GCD 1
+`endif
+
 // Elements per cycle in ternip_rms (squarers / normalise multipliers); 0 = VectorParallelism.
 // Must divide VectorParallelism. Narrower RMS overlaps with tmatmul streaming (see ternip_rms).
 `ifndef TERNIP_RMS_PARALLELISM
