@@ -288,6 +288,19 @@ localparam tdot_correction_e  TmatmulCorrection = `TERNIP_TMATMUL_CORRECTION;
 localparam int                TmatmulGpcK         = `TERNIP_TMATMUL_GPC_K;
 localparam int                TmatmulGpcFinalRows = `TERNIP_TMATMUL_GPC_FINAL_ROWS;
 localparam bit                TmatmulGpcAdd       = `TERNIP_TMATMUL_GPC_ADD;
+// 1: the tdot accumulator's in_ready is a register (its credit compare is done a cycle
+// early) and the pair tables drive their GO-stage clock enables from replicated
+// registers instead of one LUT. Cycle-for-cycle identical to 0.
+`ifndef TERNIP_TDOT_REGISTERED_READY
+`define TERNIP_TDOT_REGISTERED_READY 0
+`endif
+localparam bit                TdotRegisteredReady = `TERNIP_TDOT_REGISTERED_READY;
+// 1: tmatmul runs IMPORT / EXPORT beside GO (two pair-table banks, two exportvector
+// banks; TERNARY_PAIR4 only). Results are those of running the commands in order.
+`ifndef TERNIP_TMATMUL_OVERLAP
+`define TERNIP_TMATMUL_OVERLAP 0
+`endif
+localparam bit                TmatmulOverlap      = `TERNIP_TMATMUL_OVERLAP;
 
 `ifndef TERNIP_WEIGHT_DIST
 `define TERNIP_WEIGHT_DIST WEIGHT_DIST_COMB

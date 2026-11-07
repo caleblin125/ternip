@@ -97,6 +97,7 @@ module ternip_tdot_accumulator #(
     input  logic                     rst_ni,
 
     output logic                     in_ready_o,
+    output logic                     in_ready_next_o, // in_ready_o one cycle later (ones' datapaths)
     input  logic                     in_valid_i,
     input  logic                     in_final_i,
     input  logic [NUM_LANES-1:0]     in_pos_i,
@@ -353,6 +354,8 @@ if (Arith == ternip_pkg::TDOT_TWOS_ADDER_TREE) begin : twos
         .out_result_o
     );
 
+    assign in_ready_next_o = 1'b0; // not provided by ternip_multioperand_accumulator
+
 end else begin : ones
 
     `ifndef SYNTHESIS
@@ -595,6 +598,7 @@ end else begin : ones
     // accumulator, FIFO write-to-read), so OutputFifoEls = NumStages+4 never throttles.
     localparam int OutputFifoEls = NumStages + 4;
     logic [$clog2(OutputFifoEls+1)-1:0] credits_used_d, credits_used_q;
+    logic in_ready_q; // TdotRegisteredReady: in_ready_o, see in_ready_next below
     wire credit_take = in_ready_o && in_valid_i && in_final_i;
     wire credit_return = fifo_out_ready && fifo_out_valid;
     always_comb begin
@@ -635,12 +639,25 @@ end else begin : ones
             if (final_pipeline_q[NumStages])
                 state_d = WORKING;
         end else if (state_q == WORKING) begin
-            in_ready_o = (credits_used_q < OutputFifoEls);
+            in_ready_o = ternip_pkg::TdotRegisteredReady ? in_ready_q
+                                                         : (credits_used_q < OutputFifoEls);
             fifo_in_valid = final_pipeline_q[NumStages];
             valid_pipeline_d = {valid_pipeline_q, (in_ready_o && in_valid_i)};
             final_pipeline_d = {final_pipeline_q, (in_ready_o && in_valid_i && in_final_i)};
         end
     end
+
+    // in_ready_o of the next cycle. TdotRegisteredReady takes in_ready_o from this
+    // register, so the credit compare leaves the path into the caller's clock enables.
+    wire in_ready_next = (state_d == WORKING) && (credits_used_d < OutputFifoEls);
+    assign in_ready_next_o = in_ready_next;
+    always_ff @(posedge clk_i) begin
+        if (!rst_ni) in_ready_q <= 1'b0;
+        else         in_ready_q <= in_ready_next;
+    end
+    assert property (@(posedge clk_i) disable iff (!rst_ni)
+                     in_ready_q == ((state_q == WORKING) && (credits_used_q < OutputFifoEls)))
+        else $fatal(0, "registered in_ready disagrees with the credit count");
 
     // Accumulator — gated by pipeline_data_valid at the narrow output
     typedef logic signed [AccumulatorWidth:0] unclipped_t;

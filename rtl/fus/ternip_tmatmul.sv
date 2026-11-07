@@ -46,6 +46,9 @@
 // TERNARY_PAIR4 replaces the importvector and its gearbox with pair tables
 // (ternip_tdot_pair_tables): IMPORT writes {a, b, a+b, a-b} per lane pair, GO reads
 // one table entry per 4-bit pair code. It needs a ones'-complement Arith.
+//
+// ternip_pkg::TmatmulOverlap selects ternip_tmatmul_overlap instead (TERNARY_PAIR4 only):
+// IMPORT and EXPORT run beside GO, with the same results as running the commands in order.
 
 `define SAFE_CLOG2(x) ( (((x)==1) || ((x)==0))? 1 : $clog2((x)))
 
@@ -76,6 +79,7 @@ module ternip_tmatmul #(
     input logic                     rst_ni,
 
     output logic                    in_ready_o,
+    output logic                    go_in_ready_o,  // a GO can be accepted (TmatmulOverlap: also while IMPORT/EXPORT run)
     input  logic                    in_valid_i,
     input  ternip_pkg::tmatmul_op_e in_operation_i,
     input  vector_select_t          in_vector_select_i,
@@ -135,6 +139,23 @@ function automatic tmul_result_t ternary_mul(ternary_t ternary, fixed_point_t fi
         default: return 'x;
     endcase
 endfunction
+
+if (ternip_pkg::TmatmulOverlap) begin : g_overlap
+
+`ifndef SYNTHESIS
+initial assert (Encoding == ternip_pkg::TERNARY_PAIR4)
+    else $fatal(1, "TERNIP_TMATMUL_OVERLAP needs TERNIP_TMATMUL_ENCODING TERNARY_PAIR4");
+`endif
+
+ternip_tmatmul_overlap #(
+    .Cfg(Cfg),
+    .Arith(Arith),
+    .Correction(Correction)
+) overlap (.*);
+
+end else begin : g_serial // the serial unit (body not re-indented)
+
+assign go_in_ready_o = in_ready_o;
 
 enum logic [1:0] {
     WAITING_FOR_IN,
@@ -333,6 +354,7 @@ for (genvar i_GEN = 0; i_GEN < RowParallelism; i_GEN++) begin : row
             .clk_i,
             .rst_ni,
             .in_ready_o(accumulator_in_ready[i_GEN]),
+            .in_ready_next_o(),
             .in_valid_i(accumulator_in_valid),
             .in_final_i(accumulator_in_final),
             .in_pos_i(weight_pos[i_GEN*ImportVectorRowWidth +: ImportVectorRowWidth]),
@@ -492,10 +514,12 @@ if (Tlut) begin : pair_tables
         .imp_clear_i(in_state_waiting_for_in_q),
         .imp_valid_i(import_skid_out_valid),
         .imp_act_i(import_skid_out_data),
+        .imp_bank_i(1'b0),
         .imp_busy_o(tlut_imp_busy),
         .go_ready_o(tlut_go_ready),
         .go_valid_i(tlut_go_valid),
         .go_final_i(tlut_go_final),
+        .go_bank_i(1'b0),
         .go_row_i(importvector_request_addr_counter_q[`SAFE_CLOG2(DdrReadsPerRow)-1:0]),
         .go_codes_i(ddr_r_data_i),
         .out_ready_i(accumulator_out_ready),
@@ -835,6 +859,8 @@ always_ff @(posedge clk_i) begin
     end
     `endif
 end
+
+end : g_serial
 
 endmodule
 

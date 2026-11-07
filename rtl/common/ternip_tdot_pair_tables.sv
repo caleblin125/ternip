@@ -21,6 +21,13 @@
 // ternip_tdot_accumulator per row (ones'-complement CSA / adder tree / GPC). The two input
 // stages advance together whenever the accumulator takes a beat or stage 2 is empty.
 //
+// BANKS = 2 (ternip_pkg::TmatmulOverlap): every table holds two banks (64 deep: twice the
+// LUTRAM), so the next IMPORT fills one bank while GO still reads the other.
+//
+// ternip_pkg::TdotRegisteredReady: go_ready_o (the clock enable of both GO stages, ~1,500
+// flops at TP 128) is a register with MAX_FANOUT replication, computed a cycle early from
+// the accumulator's in_ready_next_o, instead of a LUT behind the credit counter.
+//
 // Storage per pair vs the activation buffer: 4*(ACT_WIDTH+1) bits per row instead of
 // 2*ACT_WIDTH (+6% bits / weight-row more than 2x), but the activation buffer's pipeline
 // registers (three TP-wide words in ternip_pipelined_mem) and the import gearbox (one
@@ -41,6 +48,7 @@ module ternip_tdot_pair_tables #(
     parameter int GPC_FINAL_ROWS = 2,
     parameter bit GPC_ADD = 0,
     parameter int D = 1,
+    parameter int BANKS = 1,                // table banks: 2 lets IMPORT fill one while GO reads the other
 
     localparam int Pairs = NUM_LANES / 2,
     localparam type act_t = logic signed [ACT_WIDTH-1:0],
@@ -53,12 +61,14 @@ module ternip_tdot_pair_tables #(
     input  logic                                          imp_clear_i,
     input  logic                                          imp_valid_i,
     input  act_t [IMPORT_WIDTH-1:0]                       imp_act_i,
+    input  logic                                          imp_bank_i,     // bank this IMPORT writes (BANKS = 2)
     output logic                                          imp_busy_o,
 
     // GO beats
     output logic                                          go_ready_o,
     input  logic                                          go_valid_i,
     input  logic                                          go_final_i,
+    input  logic                                          go_bank_i,      // bank this beat reads (BANKS = 2)
     input  row_index_t                                    go_row_i,
     input  logic [ROW_PARALLELISM-1:0][Pairs-1:0][3:0]    go_codes_i,
 
@@ -108,6 +118,7 @@ logic [NumBuses-1:0][1:0] bus_phase_q;
 act_t [NumBuses-1:0] bus_a_q, bus_b_q;
 slot_t [NumBuses-1:0] bus_slot_q;
 row_index_t [NumBuses-1:0] bus_row_q;
+logic [NumBuses-1:0] bus_bank_q;
 op_t [NumBuses-1:0] bus_w_data;
 
 wire logic [1:0] imp_group = 2'(imp_beat_q);
@@ -124,6 +135,7 @@ always_ff @(posedge clk_i) begin
             bus_b_q[m] <= imp_act_i[2 * (m % PairsPerBeat) + 1];
             bus_slot_q[m] <= imp_slot;
             bus_row_q[m] <= imp_row_q;
+            bus_bank_q[m] <= (BANKS > 1) ? imp_bank_i : 1'b0;
         end
     end
     if (!rst_ni) bus_active_q <= '0;
@@ -147,23 +159,41 @@ end
 assign imp_busy_o = |bus_active_q;
 
 // ---- GO stage 1: codes and row ------------------------------------------------------------
-logic go_valid_q, go_final_q;
+logic go_valid_q, go_final_q, go_bank_q;
 row_index_t go_row_q;
 logic [ROW_PARALLELISM-1:0][Pairs-1:0][3:0] go_codes_q;
 
-logic acc_in_ready;
+logic acc_in_ready, acc_in_ready_next;
+logic go_ready; // clock enable of both GO stages
 logic op_valid_q, op_final_q;
 op_t [ROW_PARALLELISM-1:0][Pairs-1:0] op_d, op_q;
 logic [ROW_PARALLELISM-1:0][Pairs-1:0] pos_d, neg_d, pos_q, neg_q;
 
-assign go_ready_o = acc_in_ready || !op_valid_q;
+wire go_ready_now = acc_in_ready || !op_valid_q;
+
+if (ternip_pkg::TdotRegisteredReady) begin : g_registered_ready
+    // next cycle's go_ready_now: op_valid_q's next value and the accumulator's next in_ready
+    wire op_valid_next = go_ready_now ? go_valid_q : op_valid_q;
+    (* max_fanout = 64 *) logic go_ready_q;
+    always_ff @(posedge clk_i) begin
+        if (!rst_ni) go_ready_q <= 1'b1;
+        else         go_ready_q <= acc_in_ready_next || !op_valid_next;
+    end
+    assign go_ready = go_ready_q;
+    assert property (@(posedge clk_i) disable iff (!rst_ni) go_ready_q == go_ready_now)
+        else $fatal(0, "registered go_ready disagrees with the accumulator");
+end else begin : g_comb_ready
+    assign go_ready = go_ready_now;
+end
+assign go_ready_o = go_ready;
 
 always_ff @(posedge clk_i) begin
     if (!rst_ni) go_valid_q <= 1'b0;
-    else if (go_ready_o) go_valid_q <= go_valid_i;
-    if (go_ready_o) begin
+    else if (go_ready) go_valid_q <= go_valid_i;
+    if (go_ready) begin
         go_final_q <= go_final_i;
         go_row_q <= go_row_i;
+        go_bank_q <= (BANKS > 1) ? go_bank_i : 1'b0;
         go_codes_q <= go_codes_i;
     end
 end
@@ -172,13 +202,13 @@ end
 for (genvar q_GEN = 0; q_GEN < Pairs; q_GEN++) begin : pair
     localparam int M = q_GEN % NumBuses;
     localparam int Slot = q_GEN / NumBuses;
-    (* ram_style = "distributed" *) op_t mem [4*ROWS];
+    (* ram_style = "distributed" *) op_t mem [BANKS*4*ROWS];
     always_ff @(posedge clk_i)
         if (bus_active_q[M] && bus_slot_q[M] == slot_t'(Slot))
-            mem[4*bus_row_q[M] + bus_phase_q[M]] <= bus_w_data[M];
+            mem[(BANKS > 1 ? 4*ROWS*bus_bank_q[M] : 0) + 4*bus_row_q[M] + bus_phase_q[M]] <= bus_w_data[M];
     for (genvar r_GEN = 0; r_GEN < ROW_PARALLELISM; r_GEN++) begin : row
         wire logic [3:0] code = go_codes_q[r_GEN][q_GEN];
-        assign op_d[r_GEN][q_GEN] = mem[4*go_row_q + code[1:0]];
+        assign op_d[r_GEN][q_GEN] = mem[(BANKS > 1 ? 4*ROWS*go_bank_q : 0) + 4*go_row_q + code[1:0]];
         assign pos_d[r_GEN][q_GEN] = code[3] && !code[2];
         assign neg_d[r_GEN][q_GEN] = code[3] && code[2];
     end
@@ -187,8 +217,8 @@ end
 // ---- GO stage 2: operands ------------------------------------------------------------------
 always_ff @(posedge clk_i) begin
     if (!rst_ni) op_valid_q <= 1'b0;
-    else if (go_ready_o) op_valid_q <= go_valid_q;
-    if (go_ready_o) begin
+    else if (go_ready) op_valid_q <= go_valid_q;
+    if (go_ready) begin
         op_final_q <= go_final_q;
         op_q <= op_d;
         pos_q <= pos_d;
@@ -196,8 +226,9 @@ always_ff @(posedge clk_i) begin
     end
 end
 
-logic [ROW_PARALLELISM-1:0] acc_in_ready_rows;
+logic [ROW_PARALLELISM-1:0] acc_in_ready_rows, acc_in_ready_next_rows;
 assign acc_in_ready = acc_in_ready_rows[0];
+assign acc_in_ready_next = acc_in_ready_next_rows[0];
 
 for (genvar r_GEN = 0; r_GEN < ROW_PARALLELISM; r_GEN++) begin : row
     ternip_tdot_accumulator #(
@@ -214,6 +245,7 @@ for (genvar r_GEN = 0; r_GEN < ROW_PARALLELISM; r_GEN++) begin : row
         .clk_i,
         .rst_ni,
         .in_ready_o(acc_in_ready_rows[r_GEN]),
+        .in_ready_next_o(acc_in_ready_next_rows[r_GEN]),
         .in_valid_i(op_valid_q),
         .in_final_i(op_final_q),
         .in_pos_i(pos_q[r_GEN]),

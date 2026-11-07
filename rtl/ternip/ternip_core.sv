@@ -275,6 +275,7 @@ end else begin : gen_no_rms
 end
 
 logic                               tmatmul_in_ready;
+logic                               tmatmul_go_in_ready;
 logic                               tmatmul_in_valid;
 ternip_types#(Cfg)::vector_select_t tmatmul_in_vector_select;
 ternip_types#(Cfg)::ddr_address_t   tmatmul_in_go_matrix_address;
@@ -296,6 +297,7 @@ ternip_tmatmul #(
     .rst_ni,
 
     .in_ready_o(tmatmul_in_ready),
+    .go_in_ready_o(tmatmul_go_in_ready),
     .in_valid_i(tmatmul_in_valid),
     .in_operation_i(tmatmul_in_operation),
     .in_go_matrix_address_i(tmatmul_in_go_matrix_address),
@@ -340,10 +342,15 @@ end
 
 assign stall_active_o = stall_active_q;
 
+// A tmatmul GO only needs the tmatmul unit's GO slot (with TmatmulOverlap it can be
+// taken while an IMPORT / EXPORT still holds the vector-register port; otherwise the
+// two readies are the same signal).
+wire head_is_tmatmul_go = (instruction_i.fu == ternip_pkg::TMATMUL)
+                       && (instruction_i.tmatmul_op == ternip_pkg::GO);
 assign instruction_ready_o = (loadstore_in_ready
                               & rms_in_ready
                               & rowwise_operation_in_ready
-                              & tmatmul_in_ready
+                              & (head_is_tmatmul_go ? tmatmul_go_in_ready : tmatmul_in_ready)
                               & !stall_active_q);
 
 always_comb begin
