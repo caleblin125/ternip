@@ -45,7 +45,9 @@
 // ternip_pkg (TERNARY_2BIT, TDOT_TWOS_ADDER_TREE) are the original datapath.
 // TERNARY_PAIR4 replaces the importvector and its gearbox with pair tables
 // (ternip_tdot_pair_tables): IMPORT writes {a, b, a+b, a-b} per lane pair, GO reads
-// one table entry per 4-bit pair code. It needs a ones'-complement Arith.
+// one table entry per 4-bit pair code. TERNARY_GROUP4 / GROUP5 do the same with one
+// BRAM/URAM table of every sign-folded N-trit pattern per group of N lanes
+// (ternip_tdot_group_tables). Both need a ones'-complement Arith.
 //
 // ternip_pkg::TmatmulOverlap selects ternip_tmatmul_overlap instead (TERNARY_PAIR4 only):
 // IMPORT and EXPORT run beside GO, with the same results as running the commands in order.
@@ -256,7 +258,9 @@ localparam bit DirectPacked = (Encoding == ternip_pkg::TERNARY_PACKED5)
                            && (Decoder == ternip_pkg::TRIT5_DECODE_DIRECT);
 localparam int AccumulatorPackedBytes = DirectPacked ? (StreamWidth / 8) : 0;
 localparam int AccumulatorPackedWidth = DirectPacked ? StreamWidth : 1;
-localparam bit Tlut = (Encoding == ternip_pkg::TERNARY_PAIR4);
+// table datapaths: pair tables (TERNARY_PAIR4) or N-trit group tables (TERNARY_GROUP4/5)
+localparam int GroupTrits = ternip_pkg::group_trits(Encoding);
+localparam bit Tlut = (Encoding == ternip_pkg::TERNARY_PAIR4) || (GroupTrits != 0);
 
 logic [TmatmulParallelism-1:0] weight_pos, weight_neg;
 ternary_t [TmatmulParallelism-1:0] ddr_r_trits;
@@ -445,6 +449,7 @@ logic          import_skid_in_ready;
 logic          import_skid_in_valid;
 logic          import_skid_out_valid;
 vector_chunk_t import_skid_out_data;
+logic          tlut_imp_ready;     // group tables: the import beat can be taken
 
 bsg_two_fifo #(
     .width_p($bits(vector_chunk_t))
@@ -482,8 +487,8 @@ if (!Tlut) begin : g_import_gearbox
         .out_data_o(gbfifo_import_out_data)
     );
 end else begin : g_no_import_gearbox
-    // the pair tables take every chunk as it comes
-    assign gbfifo_import_in_ready = 1'b1;
+    // the pair tables take every chunk as it comes; group tables may stall one
+    assign gbfifo_import_in_ready = tlut_imp_ready;
     assign gbfifo_import_out_valid = 1'b0;
     assign gbfifo_import_out_data = '0;
 end
@@ -494,7 +499,43 @@ logic tlut_imp_busy;
 logic tlut_go_ready, tlut_go_valid, tlut_go_final;
 logic [$clog2(NumChunksPerVector+1)-1:0] import_chunk_counter_d, import_chunk_counter_q;
 
-if (Tlut) begin : pair_tables
+if (GroupTrits != 0) begin : group_tables
+    ternip_tdot_group_tables #(
+        .GROUP_TRITS(GroupTrits),
+        .NUM_LANES(ImportVectorRowWidth),
+        .ROW_PARALLELISM(RowParallelism),
+        .ROWS(DdrReadsPerRow),
+        .ACT_WIDTH(FixedPointPrecision),
+        .IMPORT_WIDTH(VectorParallelism),
+        .result_t(fixed_point_t),
+        .Arith(Arith),
+        .Correction(Correction),
+        .GPC_K(ternip_pkg::TmatmulGpcK),
+        .GPC_FINAL_ROWS(ternip_pkg::TmatmulGpcFinalRows),
+        .GPC_ADD(ternip_pkg::TmatmulGpcAdd),
+        .D(D),
+        .URAM_UNITS(ternip_pkg::TmatmulGroupUramUnits),
+        .STREAM_WIDTH(StreamWidth)
+    ) tables (
+        .clk_i,
+        .rst_ni,
+        .imp_clear_i(in_state_waiting_for_in_q),
+        .imp_ready_o(tlut_imp_ready),
+        .imp_valid_i(import_skid_out_valid),
+        .imp_act_i(import_skid_out_data),
+        .imp_busy_o(tlut_imp_busy),
+        .go_ready_o(tlut_go_ready),
+        .go_valid_i(tlut_go_valid),
+        .go_final_i(tlut_go_final),
+        .go_row_i(importvector_request_addr_counter_q[`SAFE_CLOG2(DdrReadsPerRow)-1:0]),
+        .go_codes_i(ddr_r_data_i),
+        .out_ready_i(accumulator_out_ready),
+        .out_valid_o(accumulator_out_valid),
+        .out_result_o(accumulator_result)
+    );
+    assign accumulator_in_ready = '1;
+end else if (Tlut) begin : pair_tables
+    assign tlut_imp_ready = 1'b1;
     ternip_tdot_pair_tables #(
         .NUM_LANES(ImportVectorRowWidth),
         .ROW_PARALLELISM(RowParallelism),
@@ -528,6 +569,7 @@ if (Tlut) begin : pair_tables
     );
     assign accumulator_in_ready = '1;
 end else begin : g_no_pair_tables
+    assign tlut_imp_ready = 1'b1;
     assign tlut_imp_busy = 1'b0;
     assign tlut_go_ready = 1'b0;
 end
@@ -680,7 +722,7 @@ always_comb begin
         if (Tlut) begin
             // the pair tables take each chunk off the skid; done once the last
             // chunk is in and the table write buses are idle
-            if (import_skid_out_valid) begin
+            if (import_skid_out_valid && tlut_imp_ready) begin
                 import_chunk_counter_d++;
                 if (import_chunk_counter_q >= NumChunksPerVector-1) import_last_d = 1;
             end
