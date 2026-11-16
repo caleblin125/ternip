@@ -258,7 +258,7 @@ localparam bit DirectPacked = (Encoding == ternip_pkg::TERNARY_PACKED5)
                            && (Decoder == ternip_pkg::TRIT5_DECODE_DIRECT);
 localparam int AccumulatorPackedBytes = DirectPacked ? (StreamWidth / 8) : 0;
 localparam int AccumulatorPackedWidth = DirectPacked ? StreamWidth : 1;
-// table datapaths: pair tables (TERNARY_PAIR4) or N-trit group tables (TERNARY_GROUP4/5)
+// table datapaths: pair tables (TERNARY_PAIR4) or N-trit group tables (TERNARY_GROUP3/4/5)
 localparam int GroupTrits = ternip_pkg::group_trits(Encoding);
 localparam bit Tlut = (Encoding == ternip_pkg::TERNARY_PAIR4) || (GroupTrits != 0);
 
@@ -515,6 +515,7 @@ if (GroupTrits != 0) begin : group_tables
         .GPC_ADD(ternip_pkg::TmatmulGpcAdd),
         .D(D),
         .URAM_UNITS(ternip_pkg::TmatmulGroupUramUnits),
+        .LUTRAM(GroupTrits == 3 && ternip_pkg::TmatmulGroupLutram),
         .STREAM_WIDTH(StreamWidth)
     ) tables (
         .clk_i,

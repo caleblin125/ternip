@@ -128,12 +128,15 @@ typedef enum logic [1:0] {
 //                   selects the sign-folded trit pattern group_pattern(N, index) (0 = all zero),
 //                   sign negates it. A beat holds ceil(TP/N) codes padded to whole bytes;
 //                   lanes past TP in the last group are 0. Read by ternip_tdot_group_tables.
+//  TERNARY_GROUP3:  the same with N = 3: 5-bit codes {sign, index 0..13} (1.67 bits per weight),
+//                   13-entry tables (LUTRAM by default, see TmatmulGroupLutram).
 typedef enum logic [2:0] {
     TERNARY_2BIT,
     TERNARY_PACKED5,
     TERNARY_PAIR4,
     TERNARY_GROUP4,
-    TERNARY_GROUP5
+    TERNARY_GROUP5,
+    TERNARY_GROUP3
 } ternary_encoding_e;
 
 // Base-3 unpacking for TERNARY_PACKED5.
@@ -264,12 +267,15 @@ function automatic integer tmatmul_stream_width(ternary_encoding_e encoding, int
         return 8 * ((7 * ((parallelism + 3) / 4) + 7) / 8);
     if (encoding == TERNARY_GROUP5)
         return 8 * ((parallelism + 4) / 5);
+    if (encoding == TERNARY_GROUP3)
+        return 8 * ((5 * ((parallelism + 2) / 3) + 7) / 8);
     return parallelism * $bits(ternary_t);
 endfunction
 
 // lanes per group code of a group-table encoding (0 = not a group encoding)
 function automatic integer group_trits(ternary_encoding_e encoding);
-    return (encoding == TERNARY_GROUP4) ? 4 : (encoding == TERNARY_GROUP5) ? 5 : 0;
+    return (encoding == TERNARY_GROUP3) ? 3 : (encoding == TERNARY_GROUP4) ? 4
+         : (encoding == TERNARY_GROUP5) ? 5 : 0;
 endfunction
 
 // Datapath / weight-distribution knobs (parent passes -D macros; defaults =
@@ -323,6 +329,12 @@ localparam bit                TmatmulOverlap      = `TERNIP_TMATMUL_OVERLAP;
 `define TERNIP_TMATMUL_GROUP_URAM_UNITS 0
 `endif
 localparam int                TmatmulGroupUramUnits = `TERNIP_TMATMUL_GROUP_URAM_UNITS;
+// TERNARY_GROUP3: 1 = one 16-entry LUTRAM table per group (simple dual port), 0 = block RAM
+// like GROUP4/5. GROUP4/5 always use block RAM / UltraRAM.
+`ifndef TERNIP_TMATMUL_GROUP_LUTRAM
+`define TERNIP_TMATMUL_GROUP_LUTRAM 1
+`endif
+localparam bit                TmatmulGroupLutram  = `TERNIP_TMATMUL_GROUP_LUTRAM;
 
 `ifndef TERNIP_WEIGHT_DIST
 `define TERNIP_WEIGHT_DIST WEIGHT_DIST_COMB
@@ -359,6 +371,9 @@ localparam longint unsigned WeightTreeShape = `TERNIP_WEIGHT_TREE_SHAPE;
 // Step s (1..entries) builds index s from index s-1: field [4*(s-1) +: 4] = {up, k[2:0]},
 // entry(s) = entry(s-1) + (up ? act[k] : -act[k]). Pattern i: [2*N*i +: 2*N], trit k
 // (lane k of the group) as a ternary_t at bits [2k +: 2].
+localparam int GroupEntries3 = 13;
+localparam logic [51:0] GroupWalk3 = 52'h89001188a0098;
+localparam logic [83:0] GroupPattern3 = 84'h4137dc7515545c7105040;
 localparam int GroupEntries4 = 40;
 localparam logic [159:0] GroupWalk4 = 160'h0188921009898a002288110098b89001188a0098;
 localparam logic [327:0] GroupPattern4 = 328'h7071757477734347444541404c4f7f7c7d4d5d5c5f53575455515010131f1c1d111514170704050100;
@@ -366,7 +381,7 @@ localparam int GroupEntries5 = 121;
 localparam logic [483:0] GroupWalk5 = 484'h01889900a88110098b01889900288110098201889900388110098301889a1009898200aa88110098c0188921009898a002288110098b89001188a0098;
 localparam logic [1219:0] GroupPattern5 = 1220'h401014150441d0343d0c4353d4f13f4cd374d1354c5307c1f17d5f47ddf37fdfc7f5cd731cf70dc7711c5705c0741d1755d475dd377ddc7751d4711f44d174511544510541515555455d5350d4751145505405314f57d5c5754d5f57c5fd735dd745d5715c0701c4751d0771cc4311c44114411004c13c7f1f07d1345d1705f14c5715055144500401307c1c074110541405c070100500400;
 function automatic int group_entries(int n);
-    return (n == 4) ? GroupEntries4 : GroupEntries5;
+    return (n == 3) ? GroupEntries3 : (n == 4) ? GroupEntries4 : GroupEntries5;
 endfunction
 // bits per group code {sign, index}
 function automatic int group_code_bits(int n);
@@ -374,11 +389,11 @@ function automatic int group_code_bits(int n);
 endfunction
 // {up, k} of build step s (1..group_entries(n))
 function automatic logic [3:0] group_walk_step(int n, int s);
-    return (n == 4) ? GroupWalk4[4*(s-1) +: 4] : GroupWalk5[4*(s-1) +: 4];
+    return (n == 3) ? GroupWalk3[4*(s-1) +: 4] : (n == 4) ? GroupWalk4[4*(s-1) +: 4] : GroupWalk5[4*(s-1) +: 4];
 endfunction
 // trits of table index i, lane k at [2k +: 2]
 function automatic logic [9:0] group_pattern(int n, int i);
-    return (n == 4) ? 10'(GroupPattern4[8*i +: 8]) : GroupPattern5[10*i +: 10];
+    return (n == 3) ? 10'(GroupPattern3[6*i +: 6]) : (n == 4) ? 10'(GroupPattern4[8*i +: 8]) : GroupPattern5[10*i +: 10];
 endfunction
 // ---- END generated group walk ----
 

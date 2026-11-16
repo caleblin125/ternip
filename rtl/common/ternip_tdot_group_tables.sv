@@ -1,7 +1,8 @@
 // ternip_tdot_group_tables
 //
-// Table-lookup (mu = N = 4 or 5) ternary dot product for ternip_pkg::TERNARY_GROUP4 /
-// TERNARY_GROUP5 weights, in block RAM / UltraRAM. Same role as ternip_tdot_pair_tables
+// Table-lookup (mu = N = 3, 4 or 5) ternary dot product for ternip_pkg::TERNARY_GROUP3 /
+// GROUP4 / GROUP5 weights, in LUTRAM (LUTRAM = 1, meant for N = 3: 13 entries fit a 16-deep
+// table) or block RAM / UltraRAM. Same role as ternip_tdot_pair_tables
 // (it replaces tmatmul's import buffer), with one table read per group of N lanes:
 //
 //   - Lanes (Ng .. Ng+N-1) form group g (the last group is padded with zero activations).
@@ -15,7 +16,9 @@
 //   - The reduction tree has ceil(NUM_LANES/N) rows (32 / 26 at 128 lanes) instead of
 //     NUM_LANES/2 (64) for pair tables.
 //
-// Storage: two groups per RAM unit, one port each (true dual port), depth 2*ROWS*2^idx_bits
+// Storage (LUTRAM = 1): one simple dual-port table per group, depth ROWS*16 (128 x 18 at N = 3,
+// ROWS = 8), written by the group's walker, read by GO into a register (the same stage-2 latch).
+// Storage (LUTRAM = 0): two groups per RAM unit, one port each (true dual port), depth 2*ROWS*2^idx_bits
 // (1K x 18 at N = 4, ROWS = 8: one RAMB18; 2K x 19 at N = 5: one URAM, or 1.5 RAMB36).
 // Units 0 .. URAM_UNITS-1 are UltraRAM, the rest block RAM. A port writes its group's table
 // during IMPORT and reads it during GO (tmatmul never overlaps the two here).
@@ -50,6 +53,7 @@ module ternip_tdot_group_tables #(
     parameter int D = 1,
     parameter int URAM_UNITS = 0,           // two-group RAM units mapped to UltraRAM
     parameter bit OUT_REG = 1,              // RAM output register (GO stage 3)
+    parameter bit LUTRAM = 0,               // one LUTRAM table per group instead of RAM units
     parameter int STREAM_WIDTH = 8 * ((ternip_pkg::group_code_bits(GROUP_TRITS)
                                        * ((NUM_LANES + GROUP_TRITS - 1) / GROUP_TRITS) + 7) / 8),
 
@@ -95,7 +99,7 @@ typedef logic [AddrBits-1:0] addr_t;
 
 `ifndef SYNTHESIS
 initial begin
-    assert (N == 4 || N == 5) else $fatal(1, "GROUP_TRITS must be 4 or 5");
+    assert (N >= 3 && N <= 5) else $fatal(1, "GROUP_TRITS must be 3, 4 or 5");
     assert (ROW_PARALLELISM == 1) else $fatal(1, "group tables need ROW_PARALLELISM 1 (TmatmulParallelism <= D)");
     assert (NUM_LANES % IMPORT_WIDTH == 0) else $fatal(1, "NUM_LANES must be a multiple of IMPORT_WIDTH");
     assert (STREAM_WIDTH >= Groups * CodeBits) else $fatal(1, "STREAM_WIDTH too narrow for %0d codes", Groups);
@@ -179,7 +183,7 @@ for (genvar g_GEN = 0; g_GEN < Groups; g_GEN++) begin : group
     end
 
     assign walk_we[g_GEN] = walk_busy_q[g_GEN];
-    assign walk_addr[g_GEN] = table_addr(g_GEN % 2, row_q, step_q);
+    assign walk_addr[g_GEN] = table_addr(LUTRAM ? 0 : (g_GEN % 2), row_q, step_q);
     assign walk_data[g_GEN] = next;
 end
 
@@ -241,6 +245,19 @@ always_ff @(posedge clk_i) begin
     end
 end
 
+if (LUTRAM) begin : g_lutram
+// one table per group: walker writes, GO reads (never in the same row at once)
+localparam int LDepth = ROWS * Stride;
+localparam int LAddrBits = `SAFE_CLOG2(LDepth);
+for (genvar g_GEN = 0; g_GEN < Groups; g_GEN++) begin : table_g
+    (* ram_style = "distributed" *) op_t mem [LDepth];
+    wire addr_t raddr = table_addr(0, go_row_q, go_codes_q[g_GEN][IdxBits-1:0]);
+    op_t rd;
+    always_ff @(posedge clk_i) if (walk_we[g_GEN]) mem[walk_addr[g_GEN][LAddrBits-1:0]] <= walk_data[g_GEN];
+    always_ff @(posedge clk_i) if (go_ready) rd <= mem[raddr[LAddrBits-1:0]];
+    assign rd_q[g_GEN] = rd;
+end
+end else begin : g_units
 // two groups per unit, port p = group 2u+p: write while its walker runs, else read
 for (genvar u_GEN = 0; u_GEN < Units; u_GEN++) begin : unit
     localparam int G0 = 2 * u_GEN;
@@ -285,6 +302,7 @@ for (genvar u_GEN = 0; u_GEN < Units; u_GEN++) begin : unit
     if (HasB) begin : g_b
         assign rd_q[G1] = rd_b;
     end
+end
 end
 
 // ---- GO stage 3: RAM output register (optional) ---------------------------------------------
